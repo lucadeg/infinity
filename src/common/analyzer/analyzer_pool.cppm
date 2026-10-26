@@ -17,9 +17,9 @@ export module infinity_core:analyzer_pool;
 import :singleton;
 import :analyzer;
 import :status;
+import :parallel_hashmap;
 
 import std;
-import third_party;
 
 namespace infinity {
 
@@ -45,6 +45,7 @@ public:
     static constexpr std::string_view KEYWORD = "keyword";
     static constexpr std::string_view WHITESPACE = "whitespace";
     static constexpr std::string_view RANKFEATURES = "rankfeatures";
+    static constexpr std::string_view SPARSEGRAM = "sparsegram";
 
 private:
     CacheType cache_{};

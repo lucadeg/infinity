@@ -68,6 +68,7 @@ import :index_secondary_functional;
 import :index_emvb;
 import :index_bmp;
 import :index_plaid;
+import :index_smve;
 import :index_full_text;
 import :base_table_ref;
 import :table_ref;
@@ -389,8 +390,13 @@ Status LogicalPlanner::BuildInsertValue(const InsertStatement *statement, std::s
                     RecoverableError(Status::SyntaxError(fmt::format("INSERT: No default value found for column {}.", column_def->ToString())));
                 }
                 auto &dst_value = rewrite_value_list[column_idx];
+                if (column_def->default_expr_ == nullptr) {
+                    // Nullable column without explicit DEFAULT — use NULL as the default value.
+                    dst_value = std::make_shared<ValueExpression>(Value::MakeNull());
+                    continue;
+                }
                 auto default_value_expr =
-                    bind_context_ptr->expression_binder_->BuildExpression(*column_def->default_expr_.get(), bind_context_ptr.get(), 0, true);
+                    bind_context_ptr->expression_binder_->BuildExpression(*column_def->default_expr_, bind_context_ptr.get(), 0, true);
                 const std::shared_ptr<DataType> &table_column_type = column_def->column_type_;
                 DataType value_type = default_value_expr->Type();
                 if ((*table_column_type != value_type) && LogicalInsert::NeedCastInInsert(value_type, *table_column_type)) {
@@ -411,9 +417,14 @@ Status LogicalPlanner::BuildInsertValue(const InsertStatement *statement, std::s
             for (size_t column_idx = dst_value_list.size(); column_idx < table_column_count; ++column_idx) {
                 const ColumnDef *column_def = table_info->GetColumnDefByIdx(column_idx);
                 if (column_def->has_default_value()) {
-                    auto value_expr =
-                        bind_context_ptr->expression_binder_->BuildExpression(*column_def->default_expr_.get(), bind_context_ptr.get(), 0, true);
-                    dst_value_list.emplace_back(std::move(value_expr));
+                    if (column_def->default_expr_ == nullptr) {
+                        // Nullable column without explicit DEFAULT — use NULL as the default value.
+                        dst_value_list.emplace_back(std::make_shared<ValueExpression>(Value::MakeNull()));
+                    } else {
+                        auto value_expr =
+                            bind_context_ptr->expression_binder_->BuildExpression(*column_def->default_expr_, bind_context_ptr.get(), 0, true);
+                        dst_value_list.emplace_back(std::move(value_expr));
+                    }
                 } else {
                     RecoverableError(Status::SyntaxError(fmt::format("INSERT: No default value found for column {}.", column_def->ToString())));
                 }
@@ -638,10 +649,15 @@ Status LogicalPlanner::BuildCreateTable(const CreateStatement *statement, std::s
             return Status::NotSupport(err_msg);
         }
 
+        auto column_constraints = create_table_info->column_defs_[idx]->constraints_;
+        if (column_constraints.contains(ConstraintType::kPrimaryKey)) {
+            column_constraints.insert(ConstraintType::kNotNull);
+            column_constraints.insert(ConstraintType::kUnique);
+        }
         std::shared_ptr<ColumnDef> column_def = std::make_shared<ColumnDef>(idx,
                                                                             create_table_info->column_defs_[idx]->type(),
                                                                             column_name,
-                                                                            create_table_info->column_defs_[idx]->constraints_,
+                                                                            std::move(column_constraints),
                                                                             column_comment,
                                                                             create_table_info->column_defs_[idx]->default_expr_);
         columns.emplace_back(column_def);
@@ -864,11 +880,60 @@ Status LogicalPlanner::BuildCreateIndex(const CreateStatement *statement, std::s
             break;
         }
         case IndexType::kSecondary: {
-            IndexSecondary::ValidateColumnDataType(base_table_ref,
-                                                   index_info->column_name_,
-                                                   index_info->secondary_index_cardinality_); // may throw exception
-            base_index_ptr =
-                IndexSecondary::Make(index_name, index_comment, index_filename, {index_info->column_name_}, index_info->secondary_index_cardinality_);
+            std::vector<InitParameter *> param_list;
+            bool added_cardinality_param = false;
+            std::unique_ptr<InitParameter> injected_cardinality_param;
+
+            // Check if column is JSON type
+            auto &column_names_vec = *(base_table_ref->column_names_);
+            auto &column_types_vec = *(base_table_ref->column_types_);
+            size_t column_id = std::find(column_names_vec.begin(), column_names_vec.end(), index_info->column_name_) - column_names_vec.begin();
+            bool is_json_column = (column_id < column_types_vec.size()) && (column_types_vec[column_id]->type() == LogicalType::kJson);
+
+            if (index_info->index_param_list_ != nullptr) {
+                param_list = *(index_info->index_param_list_);
+            }
+            if (is_json_column) {
+                // Check if user explicitly specified cardinality=high for JSON column
+                for (const auto *param : param_list) {
+                    std::string param_name = param->param_name_;
+                    std::string param_value = param->param_value_;
+                    ToLower(param_name);
+                    ToLower(param_value);
+                    if (param_name == "cardinality" && param_value == "high") {
+                        RecoverableError(Status::InvalidIndexDefinition(
+                            fmt::format("cardinality is always low for JSON column. Column: {}", index_info->column_name_)));
+                    }
+                }
+                // Auto add cardinality=low for JSON columns if not specified
+                bool has_cardinality = false;
+                for (const auto *param : param_list) {
+                    std::string param_name = param->param_name_;
+                    ToLower(param_name);
+                    if (param_name == "cardinality") {
+                        has_cardinality = true;
+                        break;
+                    }
+                }
+                if (!has_cardinality) {
+                    injected_cardinality_param = std::make_unique<InitParameter>("cardinality", "low");
+                    param_list.push_back(injected_cardinality_param.get());
+                    added_cardinality_param = true;
+                }
+            }
+
+            base_index_ptr = IndexSecondary::Make(index_name, index_comment, index_filename, {index_info->column_name_}, param_list, is_json_column);
+
+            // Validate column type and cardinality
+            auto *secondary_index = static_cast<IndexSecondary *>(base_index_ptr.get());
+            IndexSecondary::ValidateIndexColumn(base_table_ref,
+                                                index_info->column_name_,
+                                                secondary_index->GetSecondaryIndexCardinality(),
+                                                is_json_column); // may throw exception
+
+            if (added_cardinality_param) {
+                param_list.pop_back();
+            }
             break;
         }
         case IndexType::kSecondaryFunctional: {
@@ -934,6 +999,12 @@ Status LogicalPlanner::BuildCreateIndex(const CreateStatement *statement, std::s
             IndexPLAID::ValidateColumnDataType(base_table_ref, index_info->column_name_); // may throw exception
             base_index_ptr =
                 IndexPLAID::Make(index_name, index_comment, index_filename, {index_info->column_name_}, *(index_info->index_param_list_));
+            break;
+        }
+        case IndexType::kSMVE: {
+            assert(index_info->index_param_list_ != nullptr);
+            IndexSMVE::ValidateColumnDataType(base_table_ref, index_info->column_name_); // may throw exception
+            base_index_ptr = IndexSMVE::Make(index_name, index_comment, index_filename, {index_info->column_name_}, *(index_info->index_param_list_));
             break;
         }
         case IndexType::kDiskAnn: {

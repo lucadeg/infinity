@@ -682,7 +682,14 @@ void PhysicalImport::NewCSVRowHandler(void *context_raw_ptr) {
         }
         std::shared_ptr<ColumnDef> column_def = parser_context->GetColumnDef(column_idx);
         if (column_def->has_default_value()) {
-            auto const_expr = dynamic_cast<ConstantExpr *>(column_def->default_expr_.get());
+            ConstantExpr *const_expr = nullptr;
+            ConstantExpr null_const_expr(LiteralType::kNull);
+            if (column_def->default_expr_ != nullptr) {
+                const_expr = dynamic_cast<ConstantExpr *>(column_def->default_expr_.get());
+            } else {
+                // Implicit NULL default for nullable columns without explicit default.
+                const_expr = &null_const_expr;
+            }
             column_vector.AppendByConstantExpr(const_expr);
         } else {
             Status status = Status::ImportFileFormatError(
@@ -730,7 +737,7 @@ std::shared_ptr<ConstantExpr> BuildConstantExprFromJson(std::string_view object_
         }
         case simdjson::json_type::string: {
             auto res = std::make_shared<ConstantExpr>(LiteralType::kString);
-            const std::string str = doc.get<std::string>();
+            const std::string str(doc.get<std::string_view>().value());
             res->str_value_ = strdup(str.c_str());
             return res;
         }
@@ -825,6 +832,10 @@ std::shared_ptr<ConstantExpr> BuildConstantExprFromJson(std::string_view object_
                 }
                 return res;
             }
+        }
+        case simdjson::json_type::null: {
+            auto res = std::make_shared<ConstantExpr>(LiteralType::kNull);
+            return res;
         }
         default: {
             const auto error_info = fmt::format("Unrecognized json object type");
@@ -955,6 +966,9 @@ std::shared_ptr<ConstantExpr> BuildConstantSparseExprFromJson(std::string_view o
             }
             return res;
         }
+        case simdjson::json_type::null: {
+            return std::make_shared<ConstantExpr>(LiteralType::kNull);
+        }
         default: {
             const auto error_info = fmt::format("Unrecognized json object type");
             RecoverableError(Status::ImportFileFormatError(error_info));
@@ -979,17 +993,17 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                     break;
                 }
                 case LogicalType::kTinyInt: {
-                    i8 v = val.get<i8>();
+                    i8 v = static_cast<i8>(val.get<int64_t>().value());
                     column_vector.AppendByPtr(reinterpret_cast<const char *>(&v));
                     break;
                 }
                 case LogicalType::kSmallInt: {
-                    i16 v = val.get<i16>();
+                    i16 v = static_cast<i16>(val.get<int64_t>().value());
                     column_vector.AppendByPtr(reinterpret_cast<const char *>(&v));
                     break;
                 }
                 case LogicalType::kInteger: {
-                    i32 v = val.get<i32>();
+                    i32 v = static_cast<i32>(val.get<int64_t>().value());
                     column_vector.AppendByPtr(reinterpret_cast<const char *>(&v));
                     break;
                 }
@@ -999,19 +1013,19 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                     break;
                 }
                 case LogicalType::kFloat16: {
-                    float v = val.get<float>();
+                    float v = static_cast<float>(val.get<double>().value());
                     Float16T float16_v(v);
                     column_vector.AppendByPtr(reinterpret_cast<const char *>(&float16_v));
                     break;
                 }
                 case LogicalType::kBFloat16: {
-                    float v = val.get<float>(v);
+                    float v = static_cast<float>(val.get<double>().value());
                     BFloat16T bfloat16_v(v);
                     column_vector.AppendByPtr(reinterpret_cast<const char *>(&bfloat16_v));
                     break;
                 }
                 case LogicalType::kFloat: {
-                    float v = val.get<float>(v);
+                    float v = static_cast<float>(val.get<double>().value());
                     column_vector.AppendByPtr(reinterpret_cast<const char *>(&v));
                     break;
                 }
@@ -1040,8 +1054,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                     size_t dim = embedding_info->Dimension();
                     switch (embedding_info->Type()) {
                         case EmbeddingDataType::kElemBit: {
-                            const std::vector<i8> i8_embedding = doc[column_def->name_].get<std::vector<i8>>();
-                            const size_t embedding_dim = i8_embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            const size_t embedding_dim = arr.count_elements();
+                            std::vector<i8> i8_embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                i8_embedding[idx++] = static_cast<i8>(elem.get<int64_t>().value());
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1061,8 +1080,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemUInt8: {
-                            const std::vector<u8> embedding = doc[column_def->name_].get<std::vector<u8>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<u8> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<u8>(elem.get<uint64_t>().value());
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1072,8 +1096,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemInt8: {
-                            const std::vector<i8> embedding = doc[column_def->name_].get<std::vector<i8>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<i8> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<i8>(elem.get<int64_t>().value());
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1083,8 +1112,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemInt16: {
-                            const std::vector<i16> embedding = doc[column_def->name_].get<std::vector<i16>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<i16> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<i16>(elem.get<int64_t>().value());
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1094,8 +1128,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemInt32: {
-                            const std::vector<i32> embedding = doc[column_def->name_].get<std::vector<i32>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<i32> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<i32>(elem.get<int64_t>().value());
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1105,8 +1144,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemInt64: {
-                            const std::vector<i64> embedding = doc[column_def->name_].get<std::vector<i64>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<i64> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = elem.get<int64_t>().value();
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1116,38 +1160,45 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemFloat16: {
-                            const std::vector<float> f_embedding = doc[column_def->name_].get<std::vector<float>>();
-                            size_t embedding_dim = f_embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
                                 RecoverableError(status);
                             }
                             std::vector<Float16T> embedding(embedding_dim);
-                            for (size_t k = 0; k < embedding_dim; ++k) {
-                                embedding[k] = f_embedding[k];
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<float>(elem.get<double>().value());
                             }
                             column_vector.AppendByPtr(reinterpret_cast<const char *>(embedding.data()));
                             break;
                         }
                         case EmbeddingDataType::kElemBFloat16: {
-                            const std::vector<float> f_embedding = doc[column_def->name_].get<std::vector<float>>();
-                            size_t embedding_dim = f_embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
                                 RecoverableError(status);
                             }
                             std::vector<BFloat16T> embedding(embedding_dim);
-                            for (size_t k = 0; k < embedding_dim; ++k) {
-                                embedding[k] = f_embedding[k];
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<float>(elem.get<double>().value());
                             }
                             column_vector.AppendByPtr(reinterpret_cast<const char *>(embedding.data()));
                             break;
                         }
                         case EmbeddingDataType::kElemFloat: {
-                            const std::vector<float> embedding = doc[column_def->name_].get<std::vector<float>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<float> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = static_cast<float>(elem.get<double>().value());
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1157,8 +1208,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                             break;
                         }
                         case EmbeddingDataType::kElemDouble: {
-                            const std::vector<double> embedding = doc[column_def->name_].get<std::vector<double>>();
-                            size_t embedding_dim = embedding.size();
+                            simdjson::array arr = doc[column_def->name_].get_array().value();
+                            size_t embedding_dim = arr.count_elements();
+                            std::vector<double> embedding(embedding_dim);
+                            size_t idx = 0;
+                            for (auto elem : arr) {
+                                embedding[idx++] = elem.get<double>().value();
+                            }
                             if (embedding_dim != dim) {
                                 Status status = Status::InvalidJsonFormat(
                                     fmt::format("Attempt to import {} dimension embedding into {} dimension column.", dim, embedding_dim));
@@ -1189,10 +1245,10 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                 case LogicalType::kSparse: {
                     const auto *sparse_info = static_cast<SparseInfo *>(column_vector.data_type()->type_info().get());
                     std::shared_ptr<ConstantExpr> const_expr = BuildConstantSparseExprFromJson(doc[column_def->name_].raw_json(), sparse_info);
-                    const_expr->TrySortSparseVec(column_def);
                     if (const_expr.get() == nullptr) {
                         RecoverableError(Status::ImportFileFormatError("Invalid json object."));
                     }
+                    const_expr->TrySortSparseVec(column_def);
                     column_vector.AppendByConstantExpr(const_expr.get());
                     break;
                 }
@@ -1216,7 +1272,13 @@ void PhysicalImport::JSONLRowHandler(std::string_view line_sv, std::vector<std::
                 }
             }
         } else if (column_def->has_default_value()) {
-            auto const_expr = dynamic_cast<ConstantExpr *>(column_def->default_expr_.get());
+            ConstantExpr *const_expr = nullptr;
+            ConstantExpr null_const_expr(LiteralType::kNull);
+            if (column_def->default_expr_ != nullptr) {
+                const_expr = dynamic_cast<ConstantExpr *>(column_def->default_expr_.get());
+            } else {
+                const_expr = &null_const_expr;
+            }
             column_vector.AppendByConstantExpr(const_expr);
         } else {
             Status status = Status::ImportFileFormatError(fmt::format("Column {} not found in JSON.", column_def->name_));

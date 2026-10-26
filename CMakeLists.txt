@@ -1,11 +1,15 @@
-cmake_minimum_required(VERSION 4.0.3...4.2.0)
+cmake_minimum_required(VERSION 4.0.3...4.3.4)
 
 cmake_policy(SET CMP0167 OLD)
 
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS TRUE)
 
-if (CMAKE_VERSION GREATER_EQUAL 4.0.3 AND CMAKE_VERSION LESS_EQUAL 4.2.0)
+if (CMAKE_VERSION GREATER_EQUAL 4.0.3 AND CMAKE_VERSION LESS_EQUAL 4.2.5)
     set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "d0edc3af-4c50-42ea-a356-e2862fe7a444")
+else (CMAKE_VERSION GREATER 4.2.5 AND CMAKE_VERSION LESS_EQUAL 4.3.4)
+    set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "451f2fe2-a8a2-47c3-bc32-94786d8fc91b")
+    # we use clang
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-reserved-module-identifier")
 endif ()
 
 # Auto-detect and set vcpkg toolchain if not already set
@@ -23,7 +27,10 @@ if (NOT CMAKE_TOOLCHAIN_FILE)
     endif ()
 endif ()
 
-project(infinity VERSION 0.7.0)
+# Overlay ports for patches not yet upstreamed in vcpkg
+set(VCPKG_OVERLAY_PORTS "${CMAKE_CURRENT_SOURCE_DIR}/ports")
+
+project(infinity VERSION 0.7.4)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,7 +60,9 @@ if (CLANG_VERSION_STRING VERSION_GREATER_EQUAL 20)
 
     # add_compile_options(-ftime-trace)
     #    add_compile_options(-fmodule-header)
-    add_link_options(-fuse-ld=mold)
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_link_options(-fuse-ld=mold)
+    endif ()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-unused-private-field")
 
     add_link_options(-L/usr/local/lib)
@@ -74,44 +83,14 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
     set(X86_64 TRUE)
 endif ()
 
-#strength, for image maintainer
-set(GCC_SEARCH_ROOTS
-        /usr
-        /usr/local
-)
-
-#if you encounter a problem, try commenting out the code below.
-#set(GCC15_SUFFIXES
-#        #        lib
-#        lib/gcc/15
-#	lib/gcc/aarch64-linux-gnu/15
-#        lib/gcc/x86_64-linux-gnu/15
-#        lib/gcc/x86_64-pc-linux-gnu/15.1.0
-#        lib64/gcc/x86_64-linux-gnu/15
-#        lib64/gcc/15
-#        lib64/gcc/x86_64-pc-linux-gnu/15.1.0
-#)
-#
-#find_library(STDCXX15_STATIC
-#        NAMES libstdc++.a
-#        PATHS ${GCC_SEARCH_ROOTS}
-#        PATH_SUFFIXES ${GCC15_SUFFIXES}
-#        REQUIRED
-#        NO_DEFAULT_PATH
-#)
-#
-#find_library(STDCXX15EXP_STATIC
-#        NAMES libstdc++exp.a
-#        PATHS ${GCC_SEARCH_ROOTS}
-#        PATH_SUFFIXES ${GCC15_SUFFIXES}
-#        REQUIRED
-#        NO_DEFAULT_PATH
-#)
-
-#get_filename_component(GCC15_LIB_DIR ${STDCXX15_STATIC} DIRECTORY)
+if(ARM64)
+   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DSIMDE_ENABLE_NATIVE_ALIASES")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSIMDE_ENABLE_NATIVE_ALIASES")
+endif ()
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -static-libgcc")
-########
+
+find_package(PkgConfig REQUIRED)
 
 find_package(absl CONFIG REQUIRED)
 find_package(Arrow CONFIG REQUIRED)
@@ -120,6 +99,8 @@ find_package(CLI11 CONFIG REQUIRED)
 #find_package(CURL REQUIRED) # wait for s3
 #darts-clone # wait for fix
 #eigen3 fuck this package
+#find_package(FastPFOR CONFIG REQUIRED)
+
 find_package(fmt CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(Libevent CONFIG REQUIRED)
@@ -141,57 +122,36 @@ find_package(roaring CONFIG REQUIRED)
 find_package(RocksDB CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
-#if (ARM64)
-#    find_path(SIMDE_INCLUDE_DIRS "simde/arm/neon.h")
-#endif ()
-find_package(tomlplusplus CONFIG REQUIRED)
+# find_package(tomlplusplus CONFIG REQUIRED)
 #find_package(turbobase64 CONFIG REQUIRED)
 find_package(Thrift CONFIG REQUIRED)
 #find_package(unofficial-curlpp CONFIG REQUIRED) # for s3
 find_package(unofficial-inih CONFIG REQUIRED)
 #find_path(VIT_VIT_CTPL_INCLUDE_DIRS "ctpl_stl.h")
+find_package(ZLIB REQUIRED)
 
 set(VCPKG_PROJECT_ROOT "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed")
 file(GLOB VCPKG_INCLUDE_DIRS
-        "${VCPKG_PROJECT_ROOT}/*/include"
+        "${VCPKG_PROJECT_ROOT}/${VCPKG_TARGET_TRIPLET}/include"
 )
+
+set(FASTPFOR_STATIC_LIB "${VCPKG_PROJECT_ROOT}/${VCPKG_TARGET_TRIPLET}/lib/libFastPFOR.a")
 message(STATUS "Found vcpkg include directories: ${VCPKG_INCLUDE_DIRS}")
 include_directories(${VCPKG_INCLUDE_DIRS})
 
 # vcpkg oatpp bug
 file(GLOB OATPP_INCLUDE_DIRS
-        "${VCPKG_PROJECT_ROOT}/*/include/oatpp-1.3.0/oatpp"
+        "${VCPKG_PROJECT_ROOT}/${VCPKG_TARGET_TRIPLET}/include/oatpp-1.3.0/oatpp"
 )
 message(STATUS "Found oatpp include directories: ${OATPP_INCLUDE_DIRS}")
 include_directories(${OATPP_INCLUDE_DIRS})
+
+# vcpkg simde header
+find_path(GLOB SIMDE_INCLUDE_DIRS
+        "${VCPKG_PROJECT_ROOT}/${VCPKG_TARGET_TRIPLET}/include/simde/arm/neon.h")
+include_directories(${SIMDE_INCLUDE_DIRS})
+
 message(STATUS "Using vcpkg toolchain - automatic package discovery enabled")
-
-
-## https://youtrack.jetbrains.com/issue/CPP-39632/import-std-CLion-cant-resolve-module-std-in-case-of-clang
-#add_library(unused_std_target STATIC)
-#
-## just tmp solution
-#set(LIBSTDCXX_MODULE_FILE_PATH_SUFFIX
-#        include/c++/15/bits
-#        include/c++/15.2.0/bits
-#)
-#
-#find_file(LIBSTDCXX_MODULE_FILE
-#        NAMES std.cc
-#        PATHS ${GCC_SEARCH_ROOTS}
-#        PATH_SUFFIXES ${LIBSTDCXX_MODULE_FILE_PATH_SUFFIX}
-#        REQUIRED
-#)
-#
-#get_filename_component(LIBSTDCXX_MODULE_FILE_DIR ${LIBSTDCXX_MODULE_FILE} DIRECTORY)
-#
-#target_sources(unused_std_target
-#        PRIVATE
-#        FILE_SET CXX_MODULES
-#        BASE_DIRS ${LIBSTDCXX_MODULE_FILE_DIR}
-#        FILES ${LIBSTDCXX_MODULE_FILE_DIR}/std.cc ${LIBSTDCXX_MODULE_FILE_DIR}/std.compat.cc
-#)
-
 
 # Get current system time and print the build time
 execute_process(COMMAND "date" +"%Y-%m-%d %H:%M.%S" OUTPUT_VARIABLE CURRENT_SYS_TIME)
@@ -243,8 +203,8 @@ if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
 endif ()
 
 if (ENABLE_JEMALLOC)
-    find_package(jemalloc REQUIRED)
-    set(JEMALLOC_STATIC_LIB "jemalloc_pic.a")
+    pkg_check_modules(JEMALLOC REQUIRED jemalloc)
+    set(JEMALLOC_STATIC_LIB "${VCPKG_PROJECT_ROOT}/${VCPKG_TARGET_TRIPLET}/lib/libjemalloc_pic.a")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DENABLE_JEMALLOC_PROF")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_JEMALLOC_PROF")
 endif ()
@@ -268,12 +228,12 @@ option(ENABLE_SANITIZER_ADDRESS "Enable address sanitizer" OFF)
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
 
-    set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -O3 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -DNDEBUG")
 
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
 
-    set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -O2 -g -DNDEBUG")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -g -DNDEBUG")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -g -DNDEBUG")
 
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
@@ -333,73 +293,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Werror -Wno-asm-operand-widths -W
 
 MESSAGE(STATUS "C++ Compilation flags: " ${CMAKE_CXX_FLAGS})
 
-if (APPLE)
-    if (X86_64)
-        execute_process(COMMAND sh -c "sysctl -a machdep.cpu.features | grep SSE4.2"
-                RESULT_VARIABLE SUPPORT_SSE42
-                OUTPUT_QUIET
-                ERROR_QUIET)
-
-        execute_process(COMMAND sh -c "sysctl -a machdep.cpu.features | grep AVX2"
-                RESULT_VARIABLE SUPPORT_AVX2
-                OUTPUT_QUIET
-                ERROR_QUIET)
-
-        execute_process(COMMAND sh -c "sysctl -a machdep.cpu.features | grep AVX512"
-                RESULT_VARIABLE SUPPORT_AVX512
-                OUTPUT_QUIET
-                ERROR_QUIET)
-    endif ()
-else ()
-    #Linux
-    if (X86_64)
-        execute_process(COMMAND grep -qw sse4_2 /proc/cpuinfo
-                RESULT_VARIABLE SUPPORT_SSE42
-                OUTPUT_QUIET
-                ERROR_QUIET)
-
-        execute_process(COMMAND grep -qw avx2 /proc/cpuinfo
-                RESULT_VARIABLE SUPPORT_AVX2
-                OUTPUT_QUIET
-                ERROR_QUIET)
-
-        execute_process(COMMAND grep -qw avx512f /proc/cpuinfo && grep -qw avx512dq /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo
-                RESULT_VARIABLE SUPPORT_AVX512
-                OUTPUT_QUIET
-                ERROR_QUIET)
-    endif ()
+if (NOT CMAKE_CROSSCOMPILING)
+    add_compile_options(-march=native)
 endif ()
-
-add_definitions(-DSIMDE_ENABLE_NATIVE_ALIASES)
-
-option(IS_CI_TEST_PIPELINE "is ci test pipeline: " OFF)
-
-#if (IS_CI_TEST_PIPELINE)
-#    if (X86_64)
-#        add_definitions(-march=x86-64-v2)
-#    else ()
-#        add_definitions(-march=native)
-#    endif ()
-#else ()
-if (X86_64)
-    if (SUPPORT_AVX512 EQUAL 0)
-        message(STATUS "Compiled by AVX512")
-        add_definitions(-mavx512f -mavx512dq -mavx512bw -mavx512vl -mevex512)
-    elseif (SUPPORT_AVX2 EQUAL 0)
-        message(STATUS "Compiled by AVX2")
-        add_definitions(-mavx2)
-    elseif (SUPPORT_SSE42 EQUAL 0)
-        message(STATUS "Compiled by SSE4_2")
-        add_definitions(-msse4.2)
-    else ()
-        message(FATAL_ERROR "This project requires following cpu flag: sse4_2.")
-    endif ()
-    add_definitions(-mfma -mf16c -mpopcnt -mbmi2)
-else ()
-    add_definitions(-march=native)
-endif ()
-#endif ()
-
 
 execute_process(
         COMMAND bash -c "zgrep CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS=y /proc/config.gz 2>/dev/null; grep CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS=y /boot/config-$(uname -r) 2>/dev/null"
@@ -422,17 +318,11 @@ else ()
 endif ()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-find_package(Python3 COMPONENTS Interpreter Development)
-#find_package(Python 3.8
-#        REQUIRED COMPONENTS Interpreter Development.Module
-#        OPTIONAL_COMPONENTS Development.SABIModule)
 
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif ()
-
-#add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanobind)
 
 add_subdirectory(src)
 add_subdirectory(third_party EXCLUDE_FROM_ALL)
@@ -454,48 +344,4 @@ if (SKBUILD)
     return()
 endif ()
 
-# CPack settings
-set(CPACK_PACKAGE_NAME "infinity")
-# dpkg requires version to be starting with number
-if (DEFINED CPACK_PACKAGE_VERSION)
-    string(REGEX REPLACE "^[^0-9]+" "" CPACK_PACKAGE_VERSION "${CPACK_PACKAGE_VERSION}")
-    string(REPLACE "-" "." CPACK_PACKAGE_VERSION "${CPACK_PACKAGE_VERSION}")
-endif ()
-if (NOT DEFINED CPACK_PACKAGE_VERSION OR CPACK_PACKAGE_VERSION STREQUAL "")
-    set(CPACK_PACKAGE_VERSION "${GIT_COMMIT_ID}")
-endif ()
-set(CPACK_PACKAGE_RELEASE 1)
-set(CPACK_PACKAGE_CONTACT "Zhichang Yu <yuzhichang@gmail.com>")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "The AI-native database built for LLM applications, offering incredibly fast vector and full-text search.")
-set(CPACK_PACKAGE_VENDOR "infiniflow")
-set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_HOST_SYSTEM_PROCESSOR}")
-
-# https://cmake.org/cmake/help/latest/command/install.html
-# Install target
-# WANNING: If an absolute path is given, cpack will install the specific files on the host system (requires root permission) and then included in the package.
-# If an relative path (interpreted relative to the value of the CMAKE_INSTALL_PREFIX variable) is given, cpack include specific files in the package without actually installing them on the host system.
-# CMAKE_INSTALL_PREFIX defaults to "/usr/local"
-set(CMAKE_INSTALL_PREFIX /usr)
-install(TARGETS infinity DESTINATION bin)
-install(FILES conf/infinity.service DESTINATION lib/systemd/system)
-install(FILES conf/infinity_conf.toml DESTINATION etc)
-
-# https://cmake.org/cmake/help/latest/cpack_gen/rpm.html
-# Specify the post-install script for RPM
-# CPackRPM needs the absolute path of the file as CPack does not know that script is relative to source tree.
-set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE "${CMAKE_CURRENT_SOURCE_DIR}/conf/postinst")
-
-# https://cmake.org/cmake/help/latest/cpack_gen/deb.html
-# Add custom script to the control.tar.gz. Typical usage is for conffiles, postinst, postrm, prerm.
-# Note: DEB requires the file name be one of postinst, postrm, prerm and the "+x" permission, while rpm doesn't require that.
-set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${CMAKE_CURRENT_SOURCE_DIR}/conf/postinst")
-
-# Specify the package generators
-set(CPACK_GENERATOR "RPM;DEB;TGZ")
-
-# Enable CPack debug output
-set(CPACK_PACKAGE_DEBUG True)
-
-# https://cmake.org/cmake/help/latest/variable/CPACK_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION.html
-set(CPACK_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION "ON")
-include(CPack)
+include(Packaging)

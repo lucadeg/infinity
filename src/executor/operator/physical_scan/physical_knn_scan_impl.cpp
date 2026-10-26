@@ -15,10 +15,8 @@
 module infinity_core:physical_knn_scan.impl;
 
 import :physical_knn_scan;
-import :operator_state;
 import :physical_operator_type;
 import :knn_expression;
-import :physical_filter_scan_base;
 import :logger;
 import :block_index;
 import :knn_scan_data;
@@ -55,7 +53,7 @@ import :fixed_dimensional_encoding;
 import :function_expression;
 
 import std.compat;
-import third_party;
+// import third_party;
 
 import create_index_info;
 import knn_expr;
@@ -573,6 +571,13 @@ void PhysicalKnnScan::ExecuteInternalByColumnDataTypeAndQueryDataType(QueryConte
                     NewCatalog::GetColumnVector(column_meta, column_meta.get_column_def(), row_count, ColumnVectorMode::kReadOnly, column_vector);
                 if (!status.ok()) {
                     UnrecoverableError(status.message());
+                }
+                if (column_vector.nulls_ptr_) {
+                    for (BlockOffset i = 0; i < row_count; ++i) {
+                        if (!column_vector.nulls_ptr_->IsTrue(i)) {
+                            bitmask.SetFalse(i);
+                        }
+                    }
                 }
                 BruteForceBlockScan<t, ColumnDataType, C, DistanceDataType>::Execute(merge_heap,
                                                                                      dist_func,

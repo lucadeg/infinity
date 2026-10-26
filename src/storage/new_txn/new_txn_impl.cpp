@@ -374,7 +374,6 @@ Status NewTxn::GetTables(const std::string &db_name, std::vector<std::shared_ptr
             return status;
         }
         std::shared_ptr<TableDetail> table_detail = std::make_shared<TableDetail>();
-        table_meta->SetDBTableName(db_name, table_name);
         status = table_meta->GetTableDetail(*table_detail);
         table_detail->create_ts_ = create_timestamp;
         output_table_array.push_back(table_detail);
@@ -1885,7 +1884,7 @@ Status NewTxn::CheckpointDB(DBMeta &db_meta, const CheckpointOption &option, Che
     for (size_t idx = 0; idx < table_count; ++idx) {
         const std::string &table_id_str = table_id_strs_ptr->at(idx);
         const std::string &table_name = table_names_ptr->at(idx);
-        TableMeta table_meta(db_meta.db_id_str(), table_id_str, table_name, this);
+        TableMeta table_meta(db_meta.db_id_str(), db_meta.db_name(), table_id_str, table_name, this);
         status = this->CheckpointTable(table_meta, option, ckp_txn_store);
         if (!status.ok()) {
             return status;
@@ -2465,7 +2464,6 @@ Status NewTxn::GetTableMeta(const std::string &db_name,
     if (!status.ok()) {
         return status;
     }
-    table_meta->SetDBTableName(db_name, table_name);
     return Status::OK();
 }
 
@@ -2481,8 +2479,7 @@ Status NewTxn::GetTableMeta(const std::string &table_name,
         return status;
     }
     LOG_DEBUG(fmt::format("GetTableMeta: txn_id: {} table_id: {}", TxnID(), table_id_str));
-    table_meta = std::make_shared<TableMeta>(db_meta->db_id_str(), table_id_str, table_name, this);
-    table_meta->SetDBTableName(db_meta->db_name(), table_name);
+    table_meta = std::make_shared<TableMeta>(db_meta->db_id_str(), db_meta->db_name(), table_id_str, table_name, this);
     if (table_key_ptr) {
         *table_key_ptr = table_key;
     }
@@ -2507,7 +2504,6 @@ Status NewTxn::GetTableIndexMeta(const std::string &db_name,
     if (!status.ok()) {
         return status;
     }
-    table_meta->SetDBTableName(db_name, table_name);
     status = GetTableIndexMeta(index_name, *table_meta, table_index_meta, index_key_ptr);
     if (!status.ok()) {
         return status;
@@ -2782,7 +2778,7 @@ Status NewTxn::CommitCheckpointDB(DBMeta &db_meta, const WalCmdCheckpointV2 *che
     for (size_t idx = 0; idx < table_count; ++idx) {
         const std::string &table_id_str = table_id_strs_ptr->at(idx);
         const std::string &table_name = table_names_ptr->at(idx);
-        TableMeta table_meta(db_meta.db_id_str(), table_id_str, table_name, this);
+        TableMeta table_meta(db_meta.db_id_str(), db_meta.db_name(), table_id_str, table_name, this);
         status = CommitCheckpointTable(table_meta, checkpoint_cmd);
         if (!status.ok()) {
             return status;
@@ -2829,8 +2825,11 @@ Status NewTxn::RestoreTableFromSnapshot(const WalCmdRestoreTableSnapshot *restor
             return status;
         }
     } else {
-        table_meta =
-            std::make_shared<TableMeta>(db_meta.db_id_str(), restore_table_snapshot_cmd->table_id_, restore_table_snapshot_cmd->table_name_, this);
+        table_meta = std::make_shared<TableMeta>(db_meta.db_id_str(),
+                                                 db_meta.db_name(),
+                                                 restore_table_snapshot_cmd->table_id_,
+                                                 restore_table_snapshot_cmd->table_name_,
+                                                 this);
     }
 
     // restore metadata of the table
@@ -4623,6 +4622,29 @@ void NewTxn::PostCommit() {
         sema->acquire();
     }
 
+    // A dump transaction owns the mem indexes it popped until it is resolved. The chunks are
+    // durable at this point, so release the in-memory copies (see PostRollback for the abort
+    // path, which puts them back instead).
+    if (base_txn_store_ != nullptr && base_txn_store_->type_ == TransactionType::kDumpMemIndex) {
+        auto *dump_txn_store = static_cast<DumpMemIndexTxnStore *>(base_txn_store_.get());
+        if (!dump_txn_store->dumped_mem_indexes_.empty()) {
+            auto *storage = InfinityContext::instance().storage();
+            for (auto &[segment_id, mem_index] : dump_txn_store->dumped_mem_indexes_) {
+                (void)segment_id;
+                if (mem_index == nullptr) {
+                    continue;
+                }
+                mem_index->ClearMemIndex();
+                if (storage != nullptr) {
+                    if (auto *memindex_tracer = storage->memindex_tracer(); memindex_tracer != nullptr) {
+                        memindex_tracer->DumpDone(mem_index);
+                    }
+                }
+            }
+            dump_txn_store->dumped_mem_indexes_.clear();
+        }
+    }
+
     auto *wal_manager = InfinityContext::instance().storage()->wal_manager();
     //    auto *bg_processor = InfinityContext::instance().storage()->bg_processor();
     for (const std::shared_ptr<WalCmd> &wal_cmd : wal_entry_->cmds_) {
@@ -4769,6 +4791,7 @@ Status NewTxn::PostRollback(TxnTimeStamp abort_ts) {
             MetaCache *meta_cache = txn_mgr_->storage()->meta_cache();
             CreateIndexTxnStore *create_index_txn_store = static_cast<CreateIndexTxnStore *>(base_txn_store_.get());
             TableMeta table_meta(create_index_txn_store->db_id_str_,
+                                 create_index_txn_store->db_name_,
                                  create_index_txn_store->table_id_str_,
                                  create_index_txn_store->table_name_,
                                  kv_instance_.get(),
@@ -4822,9 +4845,35 @@ Status NewTxn::PostRollback(TxnTimeStamp abort_ts) {
             for (SegmentID segment_id : dump_index_txn_store->segment_ids_) {
                 SegmentIndexMeta segment_index_meta(segment_id, *table_index_meta);
 
-                std::shared_ptr<MemIndex> mem_index = segment_index_meta.GetMemIndex();
-                if (mem_index != nullptr && mem_index->IsDumping()) {
-                    mem_index->SetIsDumping(false);
+                // Put back the mem index popped by the aborted dump: its in-memory state is the
+                // only copy of the rows the dump covered, and the chunk it produced was never
+                // committed.
+                auto dumped_iter = dump_index_txn_store->dumped_mem_indexes_.find(segment_id);
+                if (dumped_iter != dump_index_txn_store->dumped_mem_indexes_.end() && dumped_iter->second != nullptr) {
+                    std::shared_ptr<MemIndex> dumped_mem_index = dumped_iter->second;
+                    dumped_mem_index->SetIsDumping(false);
+                    if (segment_index_meta.TrySetMemIndex(dumped_mem_index)) {
+                        LOG_INFO(fmt::format("DumpMemIndex rollback: restored mem index of segment {}.{}.{}.{}",
+                                             dump_index_txn_store->db_name_,
+                                             dump_index_txn_store->table_name_,
+                                             dump_index_txn_store->index_name_,
+                                             segment_id));
+                    } else {
+                        // A newer mem index occupies the slot (an append happened after the pop),
+                        // so the two cannot be merged in place. Report it loudly; the rows stay
+                        // uncovered and are rebuilt by RecoverMemIndex on the next startup.
+                        LOG_ERROR(fmt::format("DumpMemIndex rollback: mem index of segment {}.{}.{}.{} was already replaced by a newer one; "
+                                              "rows covered by the aborted dump will only be rebuilt on next startup",
+                                              dump_index_txn_store->db_name_,
+                                              dump_index_txn_store->table_name_,
+                                              dump_index_txn_store->index_name_,
+                                              segment_id));
+                    }
+                } else {
+                    std::shared_ptr<MemIndex> mem_index = segment_index_meta.GetMemIndex();
+                    if (mem_index != nullptr && mem_index->IsDumping()) {
+                        mem_index->SetIsDumping(false);
+                    }
                 }
 
                 if (dump_index_txn_store->chunk_infos_in_segments_.contains(segment_id)) {
@@ -4840,6 +4889,7 @@ Status NewTxn::PostRollback(TxnTimeStamp abort_ts) {
             if (!status.ok()) {
                 UnrecoverableError("During PostRollback, cleanup failed.");
             }
+            dump_index_txn_store->dumped_mem_indexes_.clear();
             break;
         }
         case TransactionType::kOptimizeIndex: {
@@ -5259,7 +5309,10 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
                 if (!status.ok()) {
                     return status;
                 }
+                // Cleanup only needs the ids, so the database name is
+                // left empty.
                 TableMeta table_meta(table_meta_key->db_id_str_,
+                                     "",
                                      table_meta_key->table_id_str_,
                                      table_meta_key->table_name_,
                                      kv_instance,
@@ -5285,8 +5338,14 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
             }
             case MetaType::kSegment: {
                 auto *segment_meta_key = static_cast<SegmentMetaKey *>(meta.get());
-                TableMeta
-                    table_meta(segment_meta_key->db_id_str_, segment_meta_key->table_id_str_, "", kv_instance, begin_ts, MAX_TIMESTAMP, meta_cache);
+                TableMeta table_meta(segment_meta_key->db_id_str_,
+                                     "",
+                                     segment_meta_key->table_id_str_,
+                                     "",
+                                     kv_instance,
+                                     begin_ts,
+                                     MAX_TIMESTAMP,
+                                     meta_cache);
                 Status status = table_meta.RemoveSegmentIDs1({segment_meta_key->segment_id_});
                 if (!status.ok()) {
                     return status;
@@ -5301,7 +5360,8 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
             }
             case MetaType::kBlock: {
                 auto *block_meta_key = static_cast<BlockMetaKey *>(meta.get());
-                TableMeta table_meta(block_meta_key->db_id_str_, block_meta_key->table_id_str_, "", kv_instance, begin_ts, MAX_TIMESTAMP, meta_cache);
+                TableMeta
+                    table_meta(block_meta_key->db_id_str_, "", block_meta_key->table_id_str_, "", kv_instance, begin_ts, MAX_TIMESTAMP, meta_cache);
                 SegmentMeta segment_meta(block_meta_key->segment_id_, table_meta);
                 BlockMeta block_meta(block_meta_key->block_id_, segment_meta);
                 Status status = NewCatalog::CleanBlock(block_meta, UsageFlag::kOther);
@@ -5325,7 +5385,7 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
             case MetaType::kBlockColumn: {
                 auto *column_meta_key = static_cast<ColumnMetaKey *>(meta.get());
                 TableMeta
-                    table_meta(column_meta_key->db_id_str_, column_meta_key->table_id_str_, "", kv_instance, begin_ts, MAX_TIMESTAMP, meta_cache);
+                    table_meta(column_meta_key->db_id_str_, "", column_meta_key->table_id_str_, "", kv_instance, begin_ts, MAX_TIMESTAMP, meta_cache);
                 SegmentMeta segment_meta(column_meta_key->segment_id_, table_meta);
                 BlockMeta block_meta(column_meta_key->block_id_, segment_meta);
                 ColumnMeta column_meta(column_meta_key->column_def_->id(), block_meta);
@@ -5347,6 +5407,7 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
                 }
 
                 TableMeta table_meta(table_index_meta_key->db_id_str_,
+                                     "",
                                      table_index_meta_key->table_id_str_,
                                      "",
                                      kv_instance,
@@ -5366,6 +5427,7 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
             case MetaType::kSegmentIndex: {
                 auto *segment_index_meta_key = static_cast<SegmentIndexMetaKey *>(meta.get());
                 TableMeta table_meta(segment_index_meta_key->db_id_str_,
+                                     "",
                                      segment_index_meta_key->table_id_str_,
                                      "",
                                      kv_instance,
@@ -5383,6 +5445,7 @@ Status NewTxn::CleanupInner(const std::vector<std::shared_ptr<MetaKey>> &metas) 
             case MetaType::kChunkIndex: {
                 auto *chunk_index_meta_key = static_cast<ChunkIndexMetaKey *>(meta.get());
                 TableMeta table_meta(chunk_index_meta_key->db_id_str_,
+                                     "",
                                      chunk_index_meta_key->table_id_str_,
                                      "",
                                      kv_instance,

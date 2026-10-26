@@ -450,13 +450,6 @@ std::shared_ptr<WalCmd> WalCmd::ReadAdv(const char *&ptr, i32 max_bytes) {
             cmd = std::make_shared<WalCmdDeleteV2>(db_name, db_id, table_name, table_id, row_ids);
             break;
         }
-        case WalCommandType::CHECKPOINT: {
-            i64 max_commit_ts = ReadBufAdv<i64>(ptr);
-            std::string catalog_path = ReadBufAdv<std::string>(ptr);
-            std::string catalog_name = ReadBufAdv<std::string>(ptr);
-            cmd = std::make_shared<WalCmdCheckpoint>(max_commit_ts, catalog_path, catalog_name);
-            break;
-        }
         case WalCommandType::CHECKPOINT_V2: {
             i64 max_commit_ts = ReadBufAdv<i64>(ptr);
             cmd = std::make_shared<WalCmdCheckpointV2>(max_commit_ts);
@@ -876,11 +869,6 @@ bool WalCmdDeleteV2::operator==(const WalCmd &other) const {
     return true;
 }
 
-bool WalCmdCheckpoint::operator==(const WalCmd &other) const {
-    auto other_cmd = dynamic_cast<const WalCmdCheckpoint *>(&other);
-    return other_cmd != nullptr && max_commit_ts_ == other_cmd->max_commit_ts_;
-}
-
 bool WalCmdCheckpointV2::operator==(const WalCmd &other) const {
     auto other_cmd = dynamic_cast<const WalCmdCheckpointV2 *>(&other);
     return other_cmd != nullptr && max_commit_ts_ == other_cmd->max_commit_ts_;
@@ -1075,10 +1063,6 @@ i32 WalCmdAppendV2::GetSizeInBytes() const {
 i32 WalCmdDeleteV2::GetSizeInBytes() const {
     return sizeof(WalCommandType) + sizeof(i32) + this->db_name_.size() + sizeof(i32) + this->db_id_.size() + sizeof(i32) + this->table_name_.size() +
            sizeof(i32) + this->table_id_.size() + sizeof(i32) + row_ids_.size() * sizeof(RowID);
-}
-
-i32 WalCmdCheckpoint::GetSizeInBytes() const {
-    return sizeof(WalCommandType) + sizeof(max_commit_ts_) + sizeof(i32) + catalog_path_.size() + sizeof(i32) + catalog_name_.size();
 }
 
 i32 WalCmdCheckpointV2::GetSizeInBytes() const { return sizeof(WalCommandType) + sizeof(max_commit_ts_); }
@@ -1372,14 +1356,6 @@ void WalCmdDeleteV2::WriteAdv(char *&buf) const {
     }
 }
 
-void WalCmdCheckpoint::WriteAdv(char *&buf) const {
-    assert(!std::filesystem::path(catalog_path_).is_absolute());
-    WriteBufAdv(buf, WalCommandType::CHECKPOINT);
-    WriteBufAdv(buf, this->max_commit_ts_);
-    WriteBufAdv(buf, this->catalog_path_);
-    WriteBufAdv(buf, this->catalog_name_);
-}
-
 void WalCmdCheckpointV2::WriteAdv(char *&buf) const {
     WriteBufAdv(buf, WalCommandType::CHECKPOINT_V2);
     WriteBufAdv(buf, this->max_commit_ts_);
@@ -1607,14 +1583,6 @@ std::string WalCmdDeleteV2::ToString() const {
                        row_ids_.size());
 }
 
-std::string WalCmdCheckpoint::ToString() const {
-    std::stringstream ss;
-    ss << "Checkpoint: " << std::endl;
-    ss << "catalog path: " << fmt::format("{}/{}", catalog_path_, catalog_name_) << std::endl;
-    ss << "max commit ts: " << max_commit_ts_ << std::endl;
-    return std::move(ss).str();
-}
-
 std::string WalCmdCheckpointV2::ToString() const {
     std::stringstream ss;
     ss << "Checkpoint: " << std::endl;
@@ -1822,13 +1790,6 @@ std::string WalCmdDeleteV2::CompactInfo() const {
                        table_name_,
                        table_id_,
                        row_ids_.size());
-}
-
-std::string WalCmdCheckpoint::CompactInfo() const {
-    return fmt::format("{}: path: {}, max_commit_ts: {},",
-                       WalCmd::WalCommandTypeToString(GetType()),
-                       fmt::format("{}/{}", catalog_path_, catalog_name_),
-                       max_commit_ts_);
 }
 
 std::string WalCmdCheckpointV2::CompactInfo() const {
@@ -2113,11 +2074,6 @@ std::vector<std::shared_ptr<EraseBaseCache>> WalCmdDeleteV2::ToCachedMeta(TxnTim
     return cache_items;
 }
 
-std::vector<std::shared_ptr<EraseBaseCache>> WalCmdCheckpoint::ToCachedMeta(TxnTimeStamp commit_ts) const {
-    UnrecoverableError("WalCmdDummy::ToCachedMeta, unexpected");
-    return {};
-}
-
 std::vector<std::shared_ptr<EraseBaseCache>> WalCmdCheckpointV2::ToCachedMeta(TxnTimeStamp commit_ts) const { return {}; }
 
 std::vector<std::shared_ptr<EraseBaseCache>> WalCmdCompactV2::ToCachedMeta(TxnTimeStamp commit_ts) const {
@@ -2267,6 +2223,13 @@ std::shared_ptr<WalEntry> WalEntry::ReadAdv(const char *&ptr, i32 max_bytes) {
     entry->checksum_ = header->checksum_;
     entry->txn_id_ = header->txn_id_;
     entry->commit_ts_ = header->commit_ts_;
+    // entry->size_ is read from the on-disk header and is not trustworthy on its own; it is also what indexes
+    // into ptr below, so bound it against the frame (max_bytes) the caller handed us before touching
+    // ptr + entry->size_. Without this, a torn header can drive the reads past the end of the buffer.
+    if (entry->size_ <= static_cast<i32>(sizeof(WalEntryHeader)) || entry->size_ > max_bytes) {
+        LOG_WARN(fmt::format("WalEntry size_ {} out of range for a frame of {} bytes", entry->size_, max_bytes));
+        return nullptr;
+    }
     if (const i32 size2 = ReadBuf<i32>(ptr + entry->size_ - sizeof(i32)); entry->size_ != size2) {
         return nullptr;
     }
@@ -2274,8 +2237,9 @@ std::shared_ptr<WalEntry> WalEntry::ReadAdv(const char *&ptr, i32 max_bytes) {
         header->checksum_ = 0;
         DeferFn defer([&] { header->checksum_ = entry->checksum_; });
         if (const u32 checksum2 = CRC32IEEE::makeCRC(reinterpret_cast<const unsigned char *>(ptr), entry->size_); entry->checksum_ != checksum2) {
-            std::string error_msg = fmt::format("Command: {}, txn_id: {}, entry_size: {} checksum mismatch, expected: {}, actual: {}",
-                                                WalCmd::WalCommandTypeToString(entry->cmds_[0]->GetType()),
+            // The commands are serialized after the header and have not been parsed yet, so cmds_ is empty
+            // here; referencing cmds_[0] would index past its end and crash. Log the header fields only.
+            std::string error_msg = fmt::format("txn_id: {}, entry_size: {} checksum mismatch, expected: {}, actual: {}",
                                                 entry->txn_id_,
                                                 entry->size_,
                                                 entry->checksum_,
@@ -2306,22 +2270,6 @@ std::shared_ptr<WalEntry> WalEntry::ReadAdv(const char *&ptr, i32 max_bytes) {
     return entry;
 }
 
-bool WalEntry::IsCheckPoint(WalCmdCheckpoint *&last_checkpoint_cmd) const {
-    TxnTimeStamp max_commit_ts = 0;
-    bool found = false;
-    for (auto &cmd : cmds_) {
-        if (cmd->GetType() == WalCommandType::CHECKPOINT) {
-            auto checkpoint_cmd = static_cast<WalCmdCheckpoint *>(cmd.get());
-            if (!found || TxnTimeStamp(checkpoint_cmd->max_commit_ts_) > max_commit_ts) {
-                max_commit_ts = checkpoint_cmd->max_commit_ts_;
-                last_checkpoint_cmd = checkpoint_cmd;
-                found = true;
-            }
-        }
-    }
-    return found;
-}
-
 bool WalEntry::IsCheckPoint(WalCmdCheckpointV2 *&last_checkpoint_cmd) const {
     TxnTimeStamp max_commit_ts = 0;
     bool found = false;
@@ -2331,25 +2279,6 @@ bool WalEntry::IsCheckPoint(WalCmdCheckpointV2 *&last_checkpoint_cmd) const {
             if (!found || TxnTimeStamp(checkpoint_cmd->max_commit_ts_) > max_commit_ts) {
                 max_commit_ts = checkpoint_cmd->max_commit_ts_;
                 last_checkpoint_cmd = checkpoint_cmd;
-                found = true;
-            }
-        }
-    }
-    return found;
-}
-
-bool WalEntry::IsCheckPoint(WalCmd *&cmd) const {
-    TxnTimeStamp max_commit_ts = 0;
-    bool found = false;
-    for (auto &command : cmds_) {
-        if (command->GetType() == WalCommandType::CLEANUP) {
-            LOG_INFO("CLEANUP command found");
-        }
-        if (command->GetType() == WalCommandType::CHECKPOINT_V2) {
-            auto checkpoint_cmd = static_cast<WalCmdCheckpointV2 *>(command.get());
-            if (!found || TxnTimeStamp(checkpoint_cmd->max_commit_ts_) > max_commit_ts) {
-                max_commit_ts = checkpoint_cmd->max_commit_ts_;
-                cmd = command.get();
                 found = true;
             }
         }
@@ -2445,9 +2374,6 @@ std::string WalCmd::WalCommandTypeToString(WalCommandType type) {
             break;
         case WalCommandType::DELETE_V2:
             command = "DELETE_V2";
-            break;
-        case WalCommandType::CHECKPOINT:
-            command = "CHECKPOINT";
             break;
         case WalCommandType::CHECKPOINT_V2:
             command = "CHECKPOINT_V2";
@@ -2574,7 +2500,14 @@ std::shared_ptr<WalEntry> WalEntryIterator::GetEntryByIndex(i64 index) {
 std::vector<std::shared_ptr<WalEntry>> WalEntryIterator::GetAllEntries() {
     std::vector<std::shared_ptr<WalEntry>> entries;
     while (HasNext()) {
-        entries.emplace_back(Next());
+        auto entry = Next();
+        if (entry.get() == nullptr) {
+            // Next() reports a corrupt entry by returning nullptr without advancing, so looping on HasNext()
+            // alone would spin forever. Stop at the first corrupt entry.
+            LOG_WARN(fmt::format("Stop reading {} at a corrupt entry (offset {})", file_name_, off_));
+            break;
+        }
+        entries.emplace_back(entry);
     }
     if (is_backward_) {
         std::reverse(entries.begin(), entries.end());
@@ -2606,7 +2539,7 @@ void WalListIterator::PurgeBadEntriesAfterLatestCheckpoint(const std::vector<std
         while (iter_->HasNext()) {
             auto entry = iter_->Next();
             if (entry.get() != nullptr) {
-                WalCmdCheckpoint *checkpoint_cmd = nullptr;
+                WalCmdCheckpointV2 *checkpoint_cmd = nullptr;
                 if (entry->IsCheckPoint(checkpoint_cmd)) {
                     found_checkpoint = true;
                 }
@@ -2616,6 +2549,40 @@ void WalListIterator::PurgeBadEntriesAfterLatestCheckpoint(const std::vector<std
             }
         }
         if (bad_offset != i64(-1)) {
+            // A bad entry in front of a checkpoint in the same file only damages the region the checkpoint
+            // already covers: replay reads from the latest checkpoint onward and never needs the entries
+            // before it. Reaching such a bad entry must not take the file down. Peek backward from the tail,
+            // which walks the intact entries between the tail and the checkpoint before it hits the bad one,
+            // and when a checkpoint sits behind the bad entry, keep the file untouched. This applies whether
+            // the bad entry is at the very start of the file (offset 0, which the caller would otherwise read
+            // as a whole-file delete) or further in.
+            bool ignore_bad_entry = false;
+            {
+                auto backward_iter = WalEntryIterator::Make(*it, true);
+                while (backward_iter->HasNext()) {
+                    auto backward_entry = backward_iter->Next();
+                    if (backward_entry.get() == nullptr) {
+                        break;
+                    }
+                    WalCmdCheckpointV2 *checkpoint_cmd = nullptr;
+                    if (backward_entry->IsCheckPoint(checkpoint_cmd)) {
+                        // GetOffset() after reading the checkpoint backward is the checkpoint's start offset.
+                        // A checkpoint stored after the bad entry means the bad entry is already covered by it.
+                        ignore_bad_entry = (backward_iter->GetOffset() > bad_offset);
+                        break;
+                    }
+                }
+            }
+            if (ignore_bad_entry) {
+                // The bad entry is covered by a checkpoint further on in the same file, so it is not part of
+                // the region replay reads. Leave the file untouched and stop looking for an older checkpoint:
+                // this file already carries one that replay can start from.
+                LOG_WARN(fmt::format("Ignoring bad wal entry {}@{} (before a checkpoint in the same file)", *it, bad_offset));
+                found_checkpoint = true;
+                ++it;
+                ++file_num;
+                continue;
+            }
             std::string error_msg = fmt::format("Found bad wal entry {}@{}", *it, bad_offset);
             LOG_WARN(error_msg);
             if (bad_offset == 0) {
@@ -2665,6 +2632,12 @@ bool WalListIterator::HasNext() {
 }
 
 std::shared_ptr<WalEntry> WalListIterator::Next() {
+    if (iter_.get() == nullptr) {
+        // Reachable only when HasNext() was skipped: the purge dropped every file, or the list was empty.
+        // Return nullptr rather than dereferencing a null iterator.
+        LOG_WARN("No WAL entry to return: iterator is exhausted");
+        return nullptr;
+    }
     auto entry = iter_->Next();
     if (entry.get() == nullptr) {
         auto off = iter_->GetOffset();

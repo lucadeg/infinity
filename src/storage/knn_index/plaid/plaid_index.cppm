@@ -37,10 +37,16 @@ using PlaidQueryResultType = std::tuple<u32, std::unique_ptr<f32[]>, std::unique
 export class PlaidIndex {
 public:
     // Constructor for memory-based index
-    PlaidIndex(u32 start_segment_offset, u32 embedding_dimension, u32 nbits, u32 n_centroids = 0);
+    PlaidIndex(u32 start_segment_offset, u32 embedding_dimension, u32 nbits, u32 n_centroids = 0, bool colbertsar_mode = false);
 
     // Constructor for mmap-based index
-    PlaidIndex(u32 start_segment_offset, u32 embedding_dimension, u32 nbits, u32 n_centroids, void *mmap_addr, size_t mmap_size);
+    PlaidIndex(u32 start_segment_offset,
+               u32 embedding_dimension,
+               u32 nbits,
+               u32 n_centroids,
+               void *mmap_addr,
+               size_t mmap_size,
+               bool colbertsar_mode = false);
 
     ~PlaidIndex();
 
@@ -110,6 +116,7 @@ public:
     u32 GetNCentroids() const { return n_centroids_; }
     u32 GetEmbeddingDimension() const { return embedding_dimension_; }
     bool IsMmap() const { return is_mmap_; }
+    bool IsColBERTSaRMode() const { return colbertsar_mode_; }
 
     // Access centroids (for global centroids sharing)
     const std::vector<f32> &centroids_data() const { return global_centroids_ref_ ? global_centroids_ref_->centroids_data() : centroids_data_; }
@@ -132,8 +139,10 @@ public:
     void FinalizeMerge();
 
     // Accessors for merge operation (needed for direct data access)
-    const std::vector<u32> &centroid_ids() const { return centroid_ids_; }
+    // Note: centroid_ids() is defined inline with the data members below.
+    // Call .data() or .size() on the span, or iterate with .begin()/.end().
     const u8 *packed_residuals() const { return packed_residuals_.get(); }
+    const u8 *packed_residuals_ptr() const { return packed_residuals_.get(); }
     size_t packed_residuals_size() const { return packed_residuals_size_; }
     const std::vector<u32> &doc_lens() const { return doc_lens_; }
     const std::vector<u32> &doc_offsets() const { return doc_offsets_; }
@@ -194,8 +203,28 @@ public:
     std::vector<u32> doc_lens_;    // [n_docs_] length of each document
     std::vector<u32> doc_offsets_; // [n_docs_] offset of each doc in centroid_ids_
 
-    // Embedding data
-    std::vector<u32> centroid_ids_;          // [n_total_embeddings_] centroid assignment for each embedding
+    // Embedding data — centroid_ids supports two storage modes:
+    enum class CentroidIDsMode { kOwned, kMmap };
+    CentroidIDsMode centroid_ids_mode_ = CentroidIDsMode::kOwned;
+    std::vector<u32> owned_centroid_ids_;    // [n_total_embeddings_] owned storage
+    const u32 *mmap_centroid_ids_ = nullptr; // mmap pointer (valid only when centroid_ids_mode_ == kMmap)
+    u64 mmap_centroid_ids_size_ = 0;         // size in elements (valid only when centroid_ids_mode_ == kMmap)
+
+    // Accessors for centroid_ids
+    const u32 *centroid_ids_ptr() const { return (centroid_ids_mode_ == CentroidIDsMode::kMmap) ? mmap_centroid_ids_ : owned_centroid_ids_.data(); }
+    u64 centroid_ids_size() const { return (centroid_ids_mode_ == CentroidIDsMode::kMmap) ? mmap_centroid_ids_size_ : owned_centroid_ids_.size(); }
+    // Return a std::span for compatibility with existing iteration code (.begin(), .end(), .data(), .size())
+    std::span<const u32> centroid_ids() const { return std::span<const u32>(centroid_ids_ptr(), centroid_ids_size()); }
+    // Ensure centroid_ids data is in owned mode so it can be mutated
+    void EnsureMutableCentroidIDs() {
+        if (centroid_ids_mode_ == CentroidIDsMode::kMmap) {
+            owned_centroid_ids_.assign(mmap_centroid_ids_, mmap_centroid_ids_ + mmap_centroid_ids_size_);
+            mmap_centroid_ids_ = nullptr;
+            mmap_centroid_ids_size_ = 0;
+            centroid_ids_mode_ = CentroidIDsMode::kOwned;
+        }
+    }
+
     std::unique_ptr<u8[]> packed_residuals_; // Quantized residuals
     size_t packed_residuals_size_ = 0;
     size_t packed_residuals_capacity_ = 0; // Tracked capacity for amortized growth in MergeOneChunk
@@ -211,6 +240,9 @@ public:
 
     // Quantizer
     std::unique_ptr<PlaidQuantizer> quantizer_;
+
+    // ColBERTSaR mode (residual-free)
+    bool colbertsar_mode_ = false;
 
     // Mmap support
     void *mmap_addr_ = nullptr;
@@ -254,6 +286,9 @@ public:
     // Compute exact score with dequantization
     f32 ExactScore(const f32 *query_ptr, u32 n_query_tokens, u32 doc_id, const f32 *centroid_distances) const;
 
+    // Batch exact scoring for multiple candidates
+    void ExactScoreBatch(const f32 *query_ptr, u32 n_query_tokens, const u32 *candidate_ids, u32 n_candidates, f32 *output_scores) const;
+
     // Helper for batch centroid scoring
     std::unique_ptr<f32[]> ComputeQueryCentroidScores(const f32 *query_ptr, u32 n_query_tokens) const;
 
@@ -279,6 +314,16 @@ public:
 
     // Static helper: compute auto n_centroids using next-plaid formula
     static u32 ComputeAutoNCentroids(u64 embedding_count);
+
+    // ColBERTSaR query-aware centroid training via SGD
+    // Uses in-batch document embeddings as pseudo-queries when no external queries provided
+    // Optimizes: min_C ||Q·C[assignments]^T - Q·D^T||  (MaxSim approximation error)
+    void TrainQueryAwareCentroids(u32 n_centroids,
+                                  const f32 *embedding_data,
+                                  u64 embedding_num,
+                                  u32 batch_size = 2048,
+                                  u32 n_epochs = 50,
+                                  f32 learning_rate = 1e-4f);
 
     // Ensure IVF is in mutable (nested vector) form.
     // If currently flattened, reconstructs ivf_lists_ from ivf_data_ and clears

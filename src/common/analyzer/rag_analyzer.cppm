@@ -52,6 +52,19 @@ public:
 
     void SetEnablePosition(bool enable_position) { enable_position_ = enable_position; }
 
+    // True if the term is in the canonical RAGFlow Chinese stopword set
+    // (see rag/nlp/term_weight.py Dealer.stop_words). AnalyzeImpl drops
+    // these terms from the emitted token stream.
+    static bool IsStopword(const std::string &term);
+
+    // Fold Latin-1 Supplement / Latin Extended-A letters whose NFD
+    // decomposition is one ASCII letter plus combining marks to that base
+    // letter, preserving case (Š→S, ď→d). Letters without such a
+    // decomposition (æ, œ, ß, ø, ł, …) pass through unchanged. Applied to
+    // the whole input before tokenization when SetLanguage selected a
+    // diacritics-folding language (Slovak, Czech).
+    static std::string FoldDiacritics(const std::string &input);
+
     std::pair<std::vector<std::string>, std::vector<std::pair<unsigned, unsigned>>> TokenizeWithPosition(const std::string &line);
     std::string Tokenize(const std::string &line);
 
@@ -136,6 +149,10 @@ public:
     WordNetLemmatizer *wordnet_lemma_{nullptr};
 
     bool use_lemmatizer_{true}; // WordNet only supports English
+
+    bool use_stemmer_{true}; // Disabled for languages without a Snowball stemmer (Slovak, Czech)
+
+    bool fold_diacritics_{false}; // Fold Latin diacritics to ASCII before tokenization (Slovak, Czech)
 
     std::unique_ptr<Stemmer> stemmer_;
 

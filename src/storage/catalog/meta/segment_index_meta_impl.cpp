@@ -233,6 +233,12 @@ std::shared_ptr<MemIndex> SegmentIndexMeta::PopMemIndex() {
     return new_catalog->PopMemIndex(mem_index_key);
 }
 
+bool SegmentIndexMeta::TrySetMemIndex(const std::shared_ptr<MemIndex> &mem_index) {
+    std::string mem_index_key = GetSegmentIndexTag("mem_index");
+    NewCatalog *new_catalog = InfinityContext::instance().storage()->new_catalog();
+    return new_catalog->TrySetMemIndex(mem_index_key, mem_index);
+}
+
 Status SegmentIndexMeta::LoadChunkIDs1() {
     chunk_ids_ = std::vector<ChunkID>();
     std::vector<ChunkID> &chunk_ids = *chunk_ids_;
@@ -434,9 +440,10 @@ Status SegmentIndexMeta::LoadPlaidGlobalCentroids() {
     // Get nbits from index base
     const auto *index_plaid = static_cast<const IndexPLAID *>(index_base.get());
     const u32 nbits = index_plaid->nbits_;
+    const bool colbertsar_mode = index_plaid->colbertsar_mode_;
 
     // Create and load centroids
-    plaid_global_centroids_ = std::make_shared<PlaidGlobalCentroids>(embedding_dimension, nbits);
+    plaid_global_centroids_ = std::make_shared<PlaidGlobalCentroids>(embedding_dimension, nbits, colbertsar_mode);
 
     auto [file_handle, status] = VirtualStore::Open(centroids_file, FileAccessMode::kRead);
     if (!status.ok()) {

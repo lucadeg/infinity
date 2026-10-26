@@ -271,12 +271,13 @@ TEST_F(RAGAnalyzerTest, test_fine_grained_tokenize_consistency_with_python) {
         if (line.empty())
             continue;
 
-        TermList term_list;
-        analyzer_->Analyze(line, term_list);
+        std::string coarse = analyzer_->Tokenize(line);
+        std::vector<std::string> term_list;
+        analyzer_->FineGrainedTokenize(coarse, term_list);
 
         std::string fine_grained_tokens =
-            std::accumulate(term_list.begin(), term_list.end(), std::string(""), [](const std::string &a, const Term &b) {
-                return a + (a.empty() ? "" : " ") + b.text_;
+            std::accumulate(term_list.begin(), term_list.end(), std::string(""), [](const std::string &a, const std::string &b) {
+                return a + (a.empty() ? "" : " ") + b;
             });
 
         std::cout << "Input text: " << std::endl << line << std::endl;
@@ -291,9 +292,8 @@ TEST_F(RAGAnalyzerTest, test_fine_grained_tokenize_consistency_with_python) {
         bool is_match = true;
         if (is_size_match) {
             for (size_t i = 0; i < term_list.size(); ++i) {
-                if (term_list[i].text_ != python_tokenize_result[i]) {
-                    std::cout << "MISMATCH at " << i << ": C++='" << term_list[i].text_ << "' Python='" << python_tokenize_result[i] << "'"
-                              << std::endl;
+                if (term_list[i] != python_tokenize_result[i]) {
+                    std::cout << "MISMATCH at " << i << ": C++='" << term_list[i] << "' Python='" << python_tokenize_result[i] << "'" << std::endl;
                     is_match = false;
                     break;
                 }
@@ -337,4 +337,213 @@ TEST_F(RAGAnalyzerTest, test_set_language_dutch) {
 
     EXPECT_TRUE(cxx_result.find("huiz") != std::string::npos);
     EXPECT_EQ(cxx_result, python_result);
+}
+
+TEST_F(RAGAnalyzerTest, test_set_language_slovak) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    // Slovak has no Snowball stemmer; diacritics are folded to ASCII instead.
+    // Compare C++ result with Python result.
+    std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l slovak \"škola daňové priznanie\"";
+    std::cout << "Call Python tokenizer: " << python_cmd << std::endl;
+
+    FILE *pipe = popen(python_cmd.c_str(), "r");
+    std::string python_result;
+    char buffer[128];
+    if (pipe) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            python_result += buffer;
+        }
+        pclose(pipe);
+    }
+    // Remove trailing newline
+    python_result.erase(python_result.find_last_not_of(" \n\r\t") + 1);
+    std::cout << "Python 'škola daňové priznanie' tokenized (Slovak): " << python_result << std::endl;
+
+    analyzer_->SetLanguage("slovak");
+    std::string cxx_result = analyzer_->Tokenize("škola daňové priznanie");
+    std::cout << "C++ 'škola daňové priznanie' tokenized (Slovak): " << cxx_result << std::endl;
+
+    EXPECT_TRUE(cxx_result.find("skola") != std::string::npos);
+    EXPECT_TRUE(cxx_result.find("danove") != std::string::npos);
+    EXPECT_EQ(cxx_result, python_result);
+}
+
+TEST_F(RAGAnalyzerTest, test_set_language_czech) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l czech \"příliš žluťoučký kůň\"";
+    std::cout << "Call Python tokenizer: " << python_cmd << std::endl;
+
+    FILE *pipe = popen(python_cmd.c_str(), "r");
+    std::string python_result;
+    char buffer[128];
+    if (pipe) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            python_result += buffer;
+        }
+        pclose(pipe);
+    }
+    // Remove trailing newline
+    python_result.erase(python_result.find_last_not_of(" \n\r\t") + 1);
+    std::cout << "Python 'příliš žluťoučký kůň' tokenized (Czech): " << python_result << std::endl;
+
+    analyzer_->SetLanguage("czech");
+    std::string cxx_result = analyzer_->Tokenize("příliš žluťoučký kůň");
+    std::cout << "C++ 'příliš žluťoučký kůň' tokenized (Czech): " << cxx_result << std::endl;
+
+    EXPECT_TRUE(cxx_result.find("prilis") != std::string::npos);
+    EXPECT_TRUE(cxx_result.find("zlutoucky") != std::string::npos);
+    EXPECT_TRUE(cxx_result.find("kun") != std::string::npos);
+    EXPECT_EQ(cxx_result, python_result);
+}
+
+TEST_F(RAGAnalyzerTest, test_slovak_no_stemming) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    // Slovak disables stemming and lemmatization: "running" must pass
+    // through unstemmed and "skoly" must keep its inflected form.
+    analyzer_->SetLanguage("slovak");
+    EXPECT_EQ(analyzer_->Tokenize("skoly running"), "skoly running");
+
+    // Switching back to a Snowball language re-enables stemming.
+    analyzer_->SetLanguage("english");
+    EXPECT_EQ(analyzer_->Tokenize("running"), "run");
+}
+
+TEST_F(RAGAnalyzerTest, test_diacritics_folding_table) {
+    // All Slovak letters fold to their ASCII bases, case preserved.
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("áäčďéíĺľňóôŕšťúýž"), "aacdeillnoorstuyz");
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("ÁÄČĎÉÍĹĽŇÓÔŔŠŤÚÝŽ"), "AACDEILLNOORSTUYZ");
+    // Czech letters not in the Slovak alphabet.
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("ěřůý ĚŘŮÝ"), "eruy ERUY");
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("Škola Daňové"), "Skola Danove");
+    // Letters without a single-ASCII-letter NFD decomposition pass through.
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("æœßøłđÆŒØŁĐ"), "æœßøłđÆŒØŁĐ");
+    // Folding is deliberately limited to U+00C0-U+017F. Decomposable letters
+    // outside that range (Latin Extended Additional, precomposed Hangul, …)
+    // are left alone so the table stays in step with rag_tokenizer.py, which
+    // applies the same range guard before consulting unicodedata.
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("ḍṣṭḥ ḌỊ"), "ḍṣṭḥ ḌỊ");
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("한국어"), "한국어");
+    // Combining marks are not stripped either: an already-decomposed "š"
+    // (s + U+030C) keeps both code points on both sides.
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("s\u030Ckola"), "s\u030Ckola");
+    // ASCII and non-Latin text is untouched.
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("hello world 123"), "hello world 123");
+    EXPECT_EQ(RAGAnalyzer::FoldDiacritics("中文测试"), "中文测试");
+}
+
+TEST_F(RAGAnalyzerTest, test_out_of_range_diacritics_parity_with_python) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    // The C++ fold table covers U+00C0-U+017F only; rag_tokenizer.py applies
+    // the same range guard before NFD. Characters that decompose but sit
+    // outside the range (ḍ, ṣṭḥ) and precomposed Hangul must therefore survive
+    // identically on both sides - this is what keeps the hard-coded table and
+    // the runtime unicodedata lookup from drifting apart.
+    const std::string input = "škola ḍamage 한국어 ṣṭḥ";
+    std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l slovak \"" + input + "\"";
+    std::cout << "Call Python tokenizer: " << python_cmd << std::endl;
+
+    FILE *pipe = popen(python_cmd.c_str(), "r");
+    std::string python_result;
+    char buffer[128];
+    if (pipe) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            python_result += buffer;
+        }
+        pclose(pipe);
+    }
+    python_result.erase(python_result.find_last_not_of(" \n\r\t") + 1);
+    std::cout << "Python tokenized (Slovak): " << python_result << std::endl;
+
+    analyzer_->SetLanguage("slovak");
+    std::string cxx_result = analyzer_->Tokenize(input);
+    std::cout << "C++ tokenized (Slovak): " << cxx_result << std::endl;
+
+    // In-range diacritics fold, out-of-range ones are carried through as-is.
+    EXPECT_TRUE(cxx_result.find("skola") != std::string::npos);
+    EXPECT_TRUE(cxx_result.find("한국어") != std::string::npos);
+    EXPECT_TRUE(cxx_result.find("ṣṭḥ") != std::string::npos);
+    EXPECT_EQ(cxx_result, python_result);
+}
+
+TEST_F(RAGAnalyzerTest, test_slovak_tokenize_with_position) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    // Folding shrinks 2-byte letters to 1 byte; positions must still refer
+    // to byte offsets in the original input ("š" and "ň"/"é" are 2 bytes).
+    analyzer_->SetLanguage("slovak");
+    auto [tokens, positions] = analyzer_->TokenizeWithPosition("škola daňové");
+    ASSERT_EQ(tokens.size(), 2u);
+    EXPECT_EQ(tokens[0], "skola");
+    EXPECT_EQ(tokens[1], "danove");
+    ASSERT_EQ(positions.size(), 2u);
+    EXPECT_EQ(positions[0].first, 0u);
+    // "škola" spans bytes [0, 6) of the original input.
+    EXPECT_EQ(positions[0].second, 6u);
+    // "daňové" spans bytes [7, 15) of the original input.
+    EXPECT_EQ(positions[1].first, 7u);
+    EXPECT_EQ(positions[1].second, 15u);
+}
+
+TEST_F(RAGAnalyzerTest, test_chinese_stopword_filter) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+
+    // IsStopword is a static predicate over the canonical set.
+    EXPECT_TRUE(RAGAnalyzer::IsStopword("的"));
+    EXPECT_TRUE(RAGAnalyzer::IsStopword("是"));
+    EXPECT_TRUE(RAGAnalyzer::IsStopword("了"));
+    EXPECT_TRUE(RAGAnalyzer::IsStopword("什么"));
+    EXPECT_TRUE(RAGAnalyzer::IsStopword("怎么"));
+    EXPECT_FALSE(RAGAnalyzer::IsStopword("贡献"));
+    EXPECT_FALSE(RAGAnalyzer::IsStopword("最大"));
+    EXPECT_FALSE(RAGAnalyzer::IsStopword("谁"));
+
+    const std::string query = "谁的贡献最大";
+
+    // Path A: position disabled.
+    analyzer_->SetEnablePosition(false);
+    analyzer_->SetFineGrained(false);
+    {
+        TermList terms;
+        analyzer_->Analyze(query, terms);
+        std::cout << "[no-pos] ";
+        for (const auto &t : terms)
+            std::cout << "[" << t.text_ << "] ";
+        std::cout << std::endl;
+        for (const auto &t : terms) {
+            EXPECT_NE(t.text_, "的") << "Analyzer must drop 的 from token stream";
+        }
+    }
+
+    // Path B: position enabled (highlighter path).
+    analyzer_->SetEnablePosition(true);
+    {
+        TermList terms;
+        analyzer_->Analyze(query, terms);
+        std::cout << "[with-pos] ";
+        for (const auto &t : terms)
+            std::cout << "[" << t.text_ << "@" << t.word_offset_ << "," << t.end_offset_ << "] ";
+        std::cout << std::endl;
+        for (const auto &t : terms) {
+            EXPECT_NE(t.text_, "的") << "Position-enabled path must also drop 的";
+        }
+    }
+
+    // Path C: the raw Tokenize() string-level API is unaffected by the filter —
+    // stopword filtering lives at the AnalyzeImpl boundary so direct tokenizer
+    // callers (and unit tests of the tokenizer itself) see the unfiltered stream.
+    analyzer_->SetEnablePosition(false);
+    std::string raw = analyzer_->Tokenize(query);
+    std::cout << "[raw Tokenize] " << raw << std::endl;
+    EXPECT_NE(raw.find("的"), std::string::npos) << "Raw Tokenize() must still emit 的 (filter is only at AnalyzeImpl boundary)";
 }

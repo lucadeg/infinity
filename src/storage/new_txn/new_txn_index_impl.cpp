@@ -58,6 +58,9 @@ import :plaid_index_file_worker;
 import :plaid_index;
 import :plaid_index_disk_merger;
 import :index_plaid;
+import :index_smve;
+import :smve_index;
+import :smve_index_file_worker;
 import :emvb_index;
 import :meta_key;
 import :data_access_state;
@@ -125,7 +128,8 @@ Status NewTxn::DumpMemIndex(const std::string &db_name, const std::string &table
         SegmentIndexMeta segment_index_meta(segment_id, *table_index_meta);
 
         std::shared_ptr<MemIndex> mem_index = segment_index_meta.GetMemIndex();
-        if (mem_index == nullptr || (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr)) {
+        if (mem_index == nullptr ||
+            (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr && mem_index->GetSMVEIndex() == nullptr)) {
             continue;
         }
 
@@ -173,7 +177,8 @@ Status NewTxn::DumpMemIndex(const std::string &db_name,
     std::shared_ptr<MemIndex> mem_index = segment_index_meta.GetMemIndex();
 
     // Return when there is no mem index to dump.
-    if (mem_index == nullptr || (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr) ||
+    if (mem_index == nullptr ||
+        (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr && mem_index->GetSMVEIndex() == nullptr) ||
         (begin_row_id != RowID() && mem_index->GetBaseMemIndex() != nullptr && begin_row_id != mem_index->GetBaseMemIndex()->GetBeginRowID())) {
         LOG_WARN(fmt::format("NewTxn::DumpMemIndex skipped dumping MemIndex {}.{}.{}.{}.{} since it doesn't exist",
                              db_name,
@@ -345,6 +350,7 @@ Status NewTxn::OptimizeIndexInner(SegmentIndexMeta &segment_index_meta,
     u32 row_cnt = 0;
     u32 term_cnt = 0;
     std::vector<size_t> row_cnts;
+    std::vector<ChunkID> deprecate_ids;
 
     std::string base_name;
 
@@ -353,7 +359,7 @@ Status NewTxn::OptimizeIndexInner(SegmentIndexMeta &segment_index_meta,
         return index_status;
     }
     if (index_base->index_type_ == IndexType::kFullText) {
-        status = OptimizeFtIndex(index_base, segment_index_meta, base_rowid, row_cnt, term_cnt, base_name);
+        status = OptimizeFtIndex(index_base, segment_index_meta, base_rowid, row_cnt, term_cnt, base_name, deprecate_ids);
         if (!status.ok()) {
             return status;
         }
@@ -363,11 +369,9 @@ Status NewTxn::OptimizeIndexInner(SegmentIndexMeta &segment_index_meta,
         ChunkIndexMetaInfo *chunk_info_ptr = nullptr;
         for (ChunkID old_chunk_id : *old_chunk_ids_ptr) {
             ChunkIndexMeta old_chunk_meta(old_chunk_id, segment_index_meta);
-            {
-                status = old_chunk_meta.GetChunkInfo(chunk_info_ptr);
-                if (!status.ok()) {
-                    return status;
-                }
+            status = old_chunk_meta.GetChunkInfo(chunk_info_ptr);
+            if (!status.ok()) {
+                return status;
             }
             if (last_rowid != chunk_info_ptr->base_row_id_) {
                 UnrecoverableError("OptimizeIndex: base_row_id is not continuous");
@@ -376,8 +380,8 @@ Status NewTxn::OptimizeIndexInner(SegmentIndexMeta &segment_index_meta,
             row_cnt += chunk_info_ptr->row_cnt_;
             row_cnts.push_back(chunk_info_ptr->row_cnt_);
         }
+        deprecate_ids = *old_chunk_ids_ptr;
     }
-    std::vector<ChunkID> deprecate_ids = *old_chunk_ids_ptr;
     ChunkID chunk_id = 0;
     std::tie(chunk_id, status) = segment_index_meta.GetAndSetNextChunkID();
     if (!status.ok()) {
@@ -503,6 +507,24 @@ Status NewTxn::OptimizeIndexInner(SegmentIndexMeta &segment_index_meta,
                 column_def = std::move(col_def);
             }
             status = OptimizePlaidIndex(index_base, segment_index_meta, segment_meta, column_def, base_rowid, row_cnt, buffer_obj, deprecate_ids);
+            if (!status.ok()) {
+                return status;
+            }
+            break;
+        }
+        case IndexType::kSMVE: {
+            // SMVE optimize: rebuild from column store (same pattern as kHnsw/kBMP)
+            // SMVE currently produces single-chunk segments, but handle multi-chunk for future-proofing
+            SegmentMeta segment_meta(segment_id, table_meta);
+            std::shared_ptr<ColumnDef> column_def;
+            {
+                auto [col_def, status] = table_index_meta.GetColumnDef();
+                if (!status.ok()) {
+                    return status;
+                }
+                column_def = std::move(col_def);
+            }
+            status = OptimizeVecIndex(index_base, column_def, segment_meta, base_rowid, row_cnt, buffer_obj);
             if (!status.ok()) {
                 return status;
             }
@@ -774,6 +796,13 @@ NewTxn::AppendMemIndex(SegmentIndexMeta &segment_index_meta, BlockID block_id, c
     }
     LOG_INFO("AppendMemIndex: before GetMemIndex");
     std::shared_ptr<MemIndex> mem_index = segment_index_meta.GetMemIndex(true);
+    // GetMemIndex(true) has taken the update slot of the mem index. Release it on every exit
+    // path (including the many early returns below and exception unwinding), otherwise the
+    // slot stays taken forever and every later append / mem index dump on this index hangs.
+    struct UpdateEndGuard {
+        MemIndex *mem_index_;
+        ~UpdateEndGuard() { mem_index_->UpdateEnd(); }
+    } update_end_guard{mem_index.get()};
     LOG_INFO(fmt::format("AppendMemIndex: after GetMemIndex, ptr={}", static_cast<void *>(mem_index.get())));
     bool is_null = mem_index->IsNull();
     LOG_INFO(fmt::format("AppendMemIndex: is_null={}", is_null));
@@ -837,7 +866,11 @@ NewTxn::AppendMemIndex(SegmentIndexMeta &segment_index_meta, BlockID block_id, c
                 std::shared_ptr<std::string> index_dir = segment_index_meta.GetSegmentIndexDir();
                 auto base_name = fmt::format("ft_{:016x}", base_row_id.ToUint64());
                 auto full_path = fmt::format("{}/{}", InfinityContext::instance().config()->DataDir(), *index_dir);
+                auto [db_name, table_name] = segment_index_meta.table_index_meta().table_meta().GetDBTableName();
                 memory_indexer = std::make_unique<MemoryIndexer>(full_path, base_name, base_row_id, index_fulltext->flag_, index_fulltext->analyzer_);
+                memory_indexer->db_name_ = db_name;
+                memory_indexer->table_name_ = table_name;
+                memory_indexer->index_name_ = *index_fulltext->index_name_;
                 need_to_update_ft_segment_ts = true;
                 mem_index->SetFulltextIndex(memory_indexer);
             } else {
@@ -864,6 +897,9 @@ NewTxn::AppendMemIndex(SegmentIndexMeta &segment_index_meta, BlockID block_id, c
                 // mem_index->GetFulltextIndex()->Insert(col_ptr, offset, row_cnt, false);
                 auto append_mem_index_task = std::make_shared<AppendMemIndexTask>(mem_index, col_ptr, offset, row_cnt);
                 memory_indexer->AsyncInsertTop(append_mem_index_task.get());
+                // Bind the indexer at submit time: seq_inserted_/doc_count_ above are only valid
+                // for this indexer. The appender must not resolve it again at dequeue time.
+                append_mem_index_task->memory_indexer_ = memory_indexer;
                 auto *mem_index_appender = InfinityContext::instance().storage()->mem_index_appender();
                 mem_index_appender->Submit(append_mem_index_task);
             }
@@ -921,6 +957,21 @@ NewTxn::AppendMemIndex(SegmentIndexMeta &segment_index_meta, BlockID block_id, c
             memory_bmp_index->AddDocs(block_offset, col, offset, row_cnt);
             break;
         }
+        case IndexType::kSMVE: {
+            std::shared_ptr<SMVEIndexInMem> memory_smve_index;
+            if (is_null) {
+                auto [column_def, status] = segment_index_meta.table_index_meta().GetColumnDef();
+                if (!status.ok()) {
+                    return status;
+                }
+                memory_smve_index = std::make_shared<SMVEIndexInMem>(base_row_id, index_base.get(), column_def.get());
+                mem_index->SetSMVEIndex(memory_smve_index);
+            } else {
+                memory_smve_index = mem_index->GetSMVEIndex();
+            }
+            memory_smve_index->BuildFromColumn(col, block_offset, offset, row_cnt);
+            break;
+        }
         case IndexType::kEMVB: {
             std::shared_ptr<EMVBIndexInMem> memory_emvb_index;
             auto &table_meta = segment_index_meta.table_index_meta().table_meta();
@@ -975,7 +1026,7 @@ NewTxn::AppendMemIndex(SegmentIndexMeta &segment_index_meta, BlockID block_id, c
             UnrecoverableError("Not implemented yet");
         }
     }
-    mem_index->UpdateEnd();
+    // UpdateEnd is invoked by update_end_guard on every exit path.
     LOG_TRACE(fmt::format("NewTxn::AppendMemIndex UpdateEnd: mem_index {:p}", static_cast<void *>(mem_index.get())));
 
     // // Trigger dump if necessary
@@ -1045,6 +1096,11 @@ Status NewTxn::PopulateIndex(const std::string &db_name,
             if (!status.ok()) {
                 return status;
             }
+            if (new_chunk_ids.empty()) {
+                // No non-NULL embedding vectors in this segment; remove the segment from index
+                // so that queries will fall back to brute force search
+                table_index_meta.RemoveSegmentIndexIDs({segment_meta.segment_id()});
+            }
             break;
         }
         case IndexType::kEMVB: {
@@ -1085,6 +1141,14 @@ Status NewTxn::PopulateIndex(const std::string &db_name,
         }
         case IndexType::kBMP: {
             auto status = PopulateBMPIndexInner(index_base, *segment_index_meta, segment_meta, segment_row_cnt, column_id, column_def, new_chunk_ids);
+            if (!status.ok()) {
+                return status;
+            }
+            break;
+        }
+        case IndexType::kSMVE: {
+            auto status =
+                PopulateSMVEIndexInner(index_base, *segment_index_meta, segment_meta, segment_row_cnt, column_id, column_def, new_chunk_ids);
             if (!status.ok()) {
                 return status;
             }
@@ -1291,7 +1355,11 @@ Status NewTxn::PopulateFtIndexInner(std::shared_ptr<IndexBase> index_base,
             RowID base_row_id(segment_index_meta.segment_id(), block_id * block_capacity);
             auto base_name = fmt::format("ft_{:016x}", base_row_id.ToUint64());
             auto full_path = fmt::format("{}/{}", InfinityContext::instance().config()->DataDir(), *index_dir);
+            auto [db_name, table_name] = segment_index_meta.table_index_meta().table_meta().GetDBTableName();
             memory_indexer = std::make_shared<MemoryIndexer>(full_path, base_name, base_row_id, index_fulltext->flag_, index_fulltext->analyzer_);
+            memory_indexer->db_name_ = db_name;
+            memory_indexer->table_name_ = table_name;
+            memory_indexer->index_name_ = *index_fulltext->index_name_;
             LOG_INFO(fmt::format("PopulateFtIndexInner created memory_indexer, base_name: {}", base_name));
         }
         BlockMeta block_meta(block_id, segment_meta);
@@ -1397,7 +1465,15 @@ Status NewTxn::PopulateIvfIndexInner(std::shared_ptr<IndexBase> index_base,
     {
         BufferHandle buffer_handle = buffer_obj->Load();
         auto *data_ptr = static_cast<IVFIndexInChunk *>(buffer_handle.GetDataMut());
-        data_ptr->BuildIVFIndex(segment_meta, row_count, column_def);
+        if (!data_ptr->BuildIVFIndex(segment_meta, row_count, column_def)) {
+            // No non-NULL embedding vectors in this segment; remove the chunk we just allocated.
+            new_chunk_ids.pop_back();
+            status = segment_index_meta.RemoveChunkIDs({chunk_id});
+            if (!status.ok()) {
+                return status;
+            }
+            return Status::OK();
+        }
     }
     buffer_obj->Save();
     return Status::OK();
@@ -1704,6 +1780,13 @@ Status NewTxn::PopulateHnswIndexInner(std::shared_ptr<IndexBase> index_base,
         if (!status.ok()) {
             return status;
         }
+    }
+
+    // When the segment has no blocks (all rows deleted, etc.), there is
+    // nothing to populate.  Return early instead of crashing below with
+    // "Invalid mem index".
+    if (is_null) {
+        return Status::OK();
     }
 
     std::optional<ChunkIndexMeta> chunk_index_meta;
@@ -2098,7 +2181,8 @@ Status NewTxn::OptimizeFtIndex(std::shared_ptr<IndexBase> index_base,
                                RowID &base_rowid_out,
                                u32 &row_cnt_out,
                                u32 &term_cnt_out,
-                               std::string &base_name_out) {
+                               std::string &base_name_out,
+                               std::vector<ChunkID> &deprecate_ids) {
     const auto *index_fulltext = static_cast<const IndexFullText *>(index_base.get());
 
     std::vector<ChunkID> chunk_ids;
@@ -2174,6 +2258,7 @@ Status NewTxn::OptimizeFtIndex(std::shared_ptr<IndexBase> index_base,
         row_cnt_out = total_row_count;
         term_cnt_out = total_term_count;
         base_name_out = dst_base_name;
+        deprecate_ids = std::move(chunk_ids);
     }
 
     LOG_INFO(fmt::format("finish merging {} {}", *index_fulltext->index_name_, dst_base_name));
@@ -2241,6 +2326,29 @@ Status NewTxn::OptimizeVecIndex(std::shared_ptr<IndexBase> index_base,
             memory_bmp_index->AddDocs(base_rowid.segment_offset_, col, offset, row_cnt);
         }
         memory_bmp_index->Dump(buffer_obj);
+    } else if (index_base->index_type_ == IndexType::kSMVE) {
+        auto memory_smve_index = std::make_shared<SMVEIndexInMem>(base_rowid, index_base.get(), column_def.get());
+
+        for (BlockID block_id : *block_ids) {
+            BlockMeta block_meta(block_id, segment_meta);
+            size_t block_row_cnt = 0;
+            std::tie(block_row_cnt, status) = block_meta.GetRowCnt1();
+            if (!status.ok()) {
+                return status;
+            }
+            ColumnMeta column_meta(column_def->id(), block_meta);
+            size_t row_cnt = std::min(block_row_cnt, static_cast<size_t>(total_row_cnt));
+            total_row_cnt -= row_cnt;
+            ColumnVector col;
+            status = NewCatalog::GetColumnVector(column_meta, column_meta.get_column_def(), row_cnt, ColumnVectorMode::kReadOnly, col);
+            if (!status.ok()) {
+                return status;
+            }
+            u32 offset = 0;
+            SegmentOffset block_offset = block_id * DEFAULT_BLOCK_CAPACITY;
+            memory_smve_index->BuildFromColumn(col, block_offset, offset, row_cnt);
+        }
+        memory_smve_index->Dump(buffer_obj);
     } else {
         UnrecoverableError("Not implemented yet");
     }
@@ -2421,17 +2529,39 @@ Status NewTxn::ReplayAlterIndexByParams(WalCmdAlterIndexV2 *alter_index_cmd) {
 }
 
 Status NewTxn::DumpSegmentMemIndex(SegmentIndexMeta &segment_index_meta, const ChunkID &new_chunk_id) {
-    auto mem_index = segment_index_meta.PopMemIndex();
-    if (mem_index == nullptr || (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr)) {
-        return Status::EmptyMemIndex();
-    }
-    mem_index->WaitUpdate();
-    LOG_TRACE(fmt::format("NewTxn::DumpSegmentMemIndex WaitUpdate mem_index {:p}", static_cast<void *>(mem_index.get())));
+    // Check index type before popping mem index. For EMVB, if the index is not built yet,
+    // we must not pop it — the mem index must stay in the catalog so that searches can still
+    // fall back to exhaustive scan on the small (unbuilt) mem index.
     auto &table_index_meta = segment_index_meta.table_index_meta();
     auto [index_base, index_status] = table_index_meta.GetIndexBase();
     if (!index_status.ok()) {
         return index_status;
     }
+    if (index_base->index_type_ == IndexType::kEMVB) {
+        auto check_mem_index = segment_index_meta.GetMemIndex();
+        if (check_mem_index != nullptr) {
+            auto check_emvb = check_mem_index->GetEMVBIndex();
+            if (check_emvb != nullptr && !check_emvb->IsBuilt()) {
+                check_mem_index->SetIsDumping(false);
+                return Status::EmptyMemIndex();
+            }
+        }
+    }
+
+    auto mem_index = segment_index_meta.PopMemIndex();
+    if (mem_index == nullptr ||
+        (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr && mem_index->GetSMVEIndex() == nullptr)) {
+        return Status::EmptyMemIndex();
+    }
+    // Keep the popped index reachable from the transaction until it is resolved: on rollback it
+    // is put back into the catalog (its in-memory state is the only copy of these rows), on
+    // commit it is cleared by PostCommit. See PostRollback/PostCommit for kDumpMemIndex.
+    if (base_txn_store_ != nullptr && base_txn_store_->type_ == TransactionType::kDumpMemIndex) {
+        auto *txn_store = static_cast<DumpMemIndexTxnStore *>(base_txn_store_.get());
+        txn_store->dumped_mem_indexes_[segment_index_meta.segment_id()] = mem_index;
+    }
+    mem_index->WaitUpdate();
+    LOG_TRACE(fmt::format("NewTxn::DumpSegmentMemIndex WaitUpdate mem_index {:p}", static_cast<void *>(mem_index.get())));
 
     std::shared_ptr<SecondaryIndexInMem> memory_secondary_index;
     std::shared_ptr<IVFIndexInMem> memory_ivf_index;
@@ -2439,6 +2569,7 @@ Status NewTxn::DumpSegmentMemIndex(SegmentIndexMeta &segment_index_meta, const C
     std::shared_ptr<BMPIndexInMem> memory_bmp_index;
     std::shared_ptr<EMVBIndexInMem> memory_emvb_index;
     std::shared_ptr<PlaidIndexInMem> memory_plaid_index;
+    std::shared_ptr<SMVEIndexInMem> memory_smve_index;
 
     // dump mem index only happens in parallel with read, not write, so no lock is needed.
     switch (index_base->index_type_) {
@@ -2497,6 +2628,13 @@ Status NewTxn::DumpSegmentMemIndex(SegmentIndexMeta &segment_index_meta, const C
             }
             break;
         }
+        case IndexType::kSMVE: {
+            memory_smve_index = mem_index->GetSMVEIndex();
+            if (memory_smve_index == nullptr) {
+                return Status::EmptyMemIndex();
+            }
+            break;
+        }
         default: {
             UnrecoverableError("Not implemented yet");
         }
@@ -2510,6 +2648,8 @@ Status NewTxn::DumpSegmentMemIndex(SegmentIndexMeta &segment_index_meta, const C
         chunk_index_meta_info = mem_index->GetEMVBIndex()->GetChunkIndexMetaInfo();
     } else if (mem_index->GetPlaidIndex() != nullptr) {
         chunk_index_meta_info = mem_index->GetPlaidIndex()->GetChunkIndexMetaInfo();
+    } else if (mem_index->GetSMVEIndex() != nullptr) {
+        chunk_index_meta_info = mem_index->GetSMVEIndex()->GetChunkIndexMetaInfo();
     } else {
         UnrecoverableError("Invalid mem index");
     }
@@ -2581,6 +2721,14 @@ Status NewTxn::DumpSegmentMemIndex(SegmentIndexMeta &segment_index_meta, const C
             }
             break;
         }
+        case IndexType::kSMVE: {
+            memory_smve_index->Dump(buffer_obj);
+            buffer_obj->Save();
+            if (buffer_obj->type() != BufferType::kMmap) {
+                buffer_obj->ToMmap();
+            }
+            break;
+        }
         case IndexType::kEMVB: {
             memory_emvb_index->Dump(buffer_obj);
             buffer_obj->Save();
@@ -2623,11 +2771,18 @@ Status NewTxn::DumpSegmentMemIndex(SegmentIndexMeta &segment_index_meta, const C
         }
     }
 
+    if (base_txn_store_ != nullptr && base_txn_store_->type_ == TransactionType::kDumpMemIndex) {
+        // The popped mem index is intentionally NOT cleared here: it is owned by the transaction
+        // until the dump is committed (PostCommit clears it), so that an aborted dump can put it
+        // back instead of silently losing the rows it contains.
+        return Status::OK();
+    }
+    // Other callers (build index, replay) have no rollback path: the chunk is already written, so
+    // release the in-memory index and the tracer reservation that kept it alive right away.
     mem_index->ClearMemIndex();
     auto *storage = InfinityContext::instance().storage();
     if (storage != nullptr) {
-        auto *memindex_tracer = storage->memindex_tracer();
-        if (memindex_tracer != nullptr) {
+        if (auto *memindex_tracer = storage->memindex_tracer(); memindex_tracer != nullptr) {
             memindex_tracer->DumpDone(mem_index);
         }
     }
@@ -2657,20 +2812,39 @@ Status NewTxn::CountMemIndexGapInSegment(SegmentIndexMeta &segment_index_meta,
                       [](const ChunkIndexMetaInfo &lhs, const ChunkIndexMetaInfo &rhs) { return lhs.base_row_id_ < rhs.base_row_id_; });
     SegmentID segment_id = segment_meta.segment_id();
 
-    RowID start_row_id(segment_id, 0);
+    // The coverage of the dumped chunks is the union of their [base, base + row_cnt) intervals.
+    // It is not required to be contiguous: a chunk can be missing (aborted dump) or declare a
+    // narrower range than it really covers (rows without entries, e.g. nullable columns). Both
+    // used to be fatal here ("Chunk index row alignment error"); now they are treated as holes
+    // to be rebuilt, which is exactly what the recovery path is for.
+    std::vector<std::pair<SegmentOffset, SegmentOffset>> covered_ranges;
+    covered_ranges.reserve(chunk_index_meta_infos.size());
     for (const ChunkIndexMetaInfo &chunk_index_meta_info : chunk_index_meta_infos) {
-        if (chunk_index_meta_info.base_row_id_ != start_row_id) {
-            UnrecoverableError(fmt::format("Chunk index row alignment error: Expected {}.{} but got {}.{}",
-                                           start_row_id.segment_id_,
-                                           start_row_id.segment_offset_,
-                                           chunk_index_meta_info.base_row_id_.segment_id_,
-                                           chunk_index_meta_info.base_row_id_.segment_offset_));
-        }
-        start_row_id = chunk_index_meta_info.base_row_id_ + chunk_index_meta_info.row_cnt_;
+        const SegmentOffset begin = chunk_index_meta_info.base_row_id_.segment_offset_;
+        const SegmentOffset end = begin + chunk_index_meta_info.row_cnt_;
+        covered_ranges.emplace_back(begin, end);
         LOG_TRACE(fmt::format("CountMemIndexGapInSegment: Chunk index row id {}.{}, row count {}",
                               chunk_index_meta_info.base_row_id_.segment_id_,
                               chunk_index_meta_info.base_row_id_.segment_offset_,
                               chunk_index_meta_info.row_cnt_));
+    }
+    std::ranges::sort(covered_ranges);
+    std::vector<std::pair<SegmentOffset, SegmentOffset>> merged_covered_ranges;
+    merged_covered_ranges.reserve(covered_ranges.size());
+    for (const auto &[begin, end] : covered_ranges) {
+        if (!merged_covered_ranges.empty() && begin <= merged_covered_ranges.back().second) {
+            merged_covered_ranges.back().second = std::max(merged_covered_ranges.back().second, end);
+        } else {
+            merged_covered_ranges.emplace_back(begin, end);
+        }
+    }
+    for (size_t i = 1; i < merged_covered_ranges.size(); ++i) {
+        if (merged_covered_ranges[i - 1].second != merged_covered_ranges[i].first) {
+            LOG_WARN(fmt::format("CountMemIndexGapInSegment: segment {} has a gap in chunk coverage: [{}, {})",
+                                 segment_id,
+                                 merged_covered_ranges[i - 1].second,
+                                 merged_covered_ranges[i].first));
+        }
     }
 
     std::vector<BlockID> *block_ids_ptr = nullptr;
@@ -2681,27 +2855,90 @@ Status NewTxn::CountMemIndexGapInSegment(SegmentIndexMeta &segment_index_meta,
     size_t block_capacity = DEFAULT_BLOCK_CAPACITY;
     std::vector<BlockID> block_ids = *block_ids_ptr;
     std::ranges::sort(block_ids);
-    {
-        BlockID start_block_id = start_row_id.segment_offset_ / block_capacity;
-        BlockOffset block_offset = start_row_id.segment_offset_ % block_capacity;
-        size_t i = start_block_id;
-        if (i >= block_ids.size()) {
-            return Status::OK();
+    std::vector<size_t> block_row_cnts;
+    block_row_cnts.reserve(block_ids.size());
+    for (BlockID block_id : block_ids) {
+        BlockMeta block_meta(block_id, segment_meta);
+        size_t block_row_cnt = 0;
+        std::tie(block_row_cnt, status) = block_meta.GetRowCnt1();
+        if (!status.ok()) {
+            return status;
         }
-        for (; i < block_ids.size(); ++i) {
-            BlockID block_id = block_ids[i];
-            BlockMeta block_meta(block_id, segment_meta);
-            size_t block_row_cnt = 0;
-            std::tie(block_row_cnt, status) = block_meta.GetRowCnt1();
-            if (!status.ok() || block_row_cnt == block_offset) {
-                return status;
-            }
-            append_ranges.emplace_back(RowID(segment_id, (static_cast<u32>(block_id) << BLOCK_OFFSET_SHIFT) + block_offset),
-                                       block_row_cnt - block_offset);
-            block_offset = 0;
+        block_row_cnts.push_back(block_row_cnt);
+    }
+    append_ranges = ComputeMemIndexGapRanges(segment_id, merged_covered_ranges, block_ids, block_row_cnts, block_capacity);
+    return Status::OK();
+}
+
+std::vector<std::pair<RowID, u64>> NewTxn::ComputeMemIndexGapRanges(SegmentID segment_id,
+                                                                    const std::vector<std::pair<SegmentOffset, SegmentOffset>> &covered_ranges,
+                                                                    const std::vector<BlockID> &block_ids,
+                                                                    const std::vector<size_t> &block_row_cnts,
+                                                                    size_t block_capacity) {
+    std::vector<std::pair<RowID, u64>> append_ranges;
+    if (block_capacity == 0 || block_ids.size() != block_row_cnts.size()) {
+        return append_ranges;
+    }
+    // Row ranges covered by chunks, sorted and then merged into disjoint ascending intervals.
+    std::vector<std::pair<SegmentOffset, SegmentOffset>> sorted_covered_ranges(covered_ranges);
+    std::ranges::sort(sorted_covered_ranges);
+    std::vector<std::pair<SegmentOffset, SegmentOffset>> merged_covered_ranges;
+    merged_covered_ranges.reserve(sorted_covered_ranges.size());
+    for (const auto &[begin, end] : sorted_covered_ranges) {
+        if (end <= begin) {
+            continue;
+        }
+        if (!merged_covered_ranges.empty() && begin <= merged_covered_ranges.back().second) {
+            merged_covered_ranges.back().second = std::max(merged_covered_ranges.back().second, end);
+        } else {
+            merged_covered_ranges.emplace_back(begin, end);
         }
     }
-    return Status::OK();
+
+    size_t covered_idx = 0;
+    SegmentOffset covered_rows = 0;
+    SegmentOffset emitted_rows = 0;
+    SegmentOffset total_rows = 0;
+    for (size_t i = 0; i < block_ids.size(); ++i) {
+        const SegmentOffset block_start = static_cast<SegmentOffset>(static_cast<u32>(block_ids[i]) << BLOCK_OFFSET_SHIFT);
+        const SegmentOffset block_end = block_start + static_cast<SegmentOffset>(block_row_cnts[i]);
+        total_rows += static_cast<SegmentOffset>(block_row_cnts[i]);
+        if (block_end <= block_start) {
+            continue; // empty block
+        }
+        while (covered_idx < merged_covered_ranges.size() && merged_covered_ranges[covered_idx].second <= block_start) {
+            ++covered_idx;
+        }
+        SegmentOffset cursor = block_start;
+        for (size_t j = covered_idx; j < merged_covered_ranges.size() && merged_covered_ranges[j].first < block_end; ++j) {
+            const SegmentOffset covered_begin = std::max(merged_covered_ranges[j].first, block_start);
+            const SegmentOffset covered_end = std::min(merged_covered_ranges[j].second, block_end);
+            if (covered_end <= cursor) {
+                continue;
+            }
+            if (covered_begin > cursor) {
+                append_ranges.emplace_back(RowID(segment_id, cursor), static_cast<u64>(covered_begin - cursor));
+                emitted_rows += covered_begin - cursor;
+            }
+            covered_rows += covered_end - std::max(covered_begin, cursor);
+            cursor = covered_end;
+        }
+        if (cursor < block_end) {
+            // Note: unlike the previous implementation, a block that is already fully covered
+            // does not stop the scan -- every later block is still inspected.
+            append_ranges.emplace_back(RowID(segment_id, cursor), static_cast<u64>(block_end - cursor));
+            emitted_rows += block_end - cursor;
+        }
+    }
+    // Every row that exists in the segment is either still covered by a chunk or must be rebuilt.
+    if (emitted_rows + covered_rows != total_rows) {
+        UnrecoverableError(fmt::format("Mem index gap computation is inconsistent: segment {}, emitted {}, covered {}, total rows {}",
+                                       segment_id,
+                                       emitted_rows,
+                                       covered_rows,
+                                       total_rows));
+    }
+    return append_ranges;
 }
 
 Status NewTxn::RecoverMemIndex(TableIndexMeta &table_index_meta) {
@@ -2724,8 +2961,6 @@ Status NewTxn::RecoverMemIndex(TableIndexMeta &table_index_meta) {
     for (SegmentID segment_id : *segment_ids_ptr) {
         SegmentMeta segment_meta(segment_id, table_meta);
         if (!index_segment_ids_set.contains(segment_id)) {
-            //            std::shared_ptr<std::string> error_msg = std::make_shared<std::string>(fmt::format("Segment {} not in index {}",
-            //            segment_id, table_index_meta.index_id_str())); LOG_WARN(*error_msg); UnrecoverableError(*error_msg);//
             std::optional<SegmentIndexMeta> segment_index_meta;
             status = NewCatalog::AddNewSegmentIndex1(table_index_meta, this, segment_id, segment_index_meta);
             if (!status.ok()) {
@@ -2792,7 +3027,7 @@ Status NewTxn::PrepareCommitCreateIndex(WalCmdCreateIndexV2 *create_index_cmd) {
     const auto &index_id_str = create_index_cmd->index_id_;
     std::shared_ptr<IndexBase> &index_base = create_index_cmd->index_base_;
 
-    TableMeta table_meta(db_id_str, table_id_str, table_name, this);
+    TableMeta table_meta(db_id_str, db_name, table_id_str, table_name, this);
     std::shared_ptr<TableIndexMeta> table_index_meta_ptr;
     Status status = new_catalog_->AddNewTableIndex(table_meta, index_id_str, commit_ts, index_base, table_index_meta_ptr);
     if (!status.ok()) {
@@ -2854,6 +3089,7 @@ Status NewTxn::PrepareCommitCreateIndex(WalCmdCreateIndexV2 *create_index_cmd) {
 
 Status NewTxn::PrepareCommitDropIndex(const WalCmdDropIndexV2 *drop_index_cmd) {
     const std::string &db_id_str = drop_index_cmd->db_id_;
+    const std::string &db_name = drop_index_cmd->db_name_;
     const std::string &table_id_str = drop_index_cmd->table_id_;
     const std::string &table_name = drop_index_cmd->table_name_;
     const std::string &index_id_str = drop_index_cmd->index_id_;
@@ -2866,7 +3102,7 @@ Status NewTxn::PrepareCommitDropIndex(const WalCmdDropIndexV2 *drop_index_cmd) {
     auto ts_str = std::to_string(commit_ts);
     kv_instance_->Put(KeyEncode::DropTableIndexKey(db_id_str, table_id_str, drop_index_cmd->index_name_, create_ts, index_id_str), ts_str);
 
-    TableMeta table_meta(db_id_str, table_id_str, table_name, this);
+    TableMeta table_meta(db_id_str, db_name, table_id_str, table_name, this);
     TableIndexMeta table_index_meta(index_id_str, index_name, table_meta);
     auto [index_base, status] = table_index_meta.GetIndexBase();
     if (!status.ok()) {
@@ -2888,13 +3124,14 @@ Status NewTxn::PrepareCommitDropIndex(const WalCmdDropIndexV2 *drop_index_cmd) {
 Status NewTxn::PrepareCommitDumpIndex(const WalCmdDumpIndexV2 *dump_index_cmd, KVInstance *kv_instance) {
     const TxnTimeStamp commit_ts = txn_context_ptr_->commit_ts_;
     const std::string &db_id_str = dump_index_cmd->db_id_;
+    const std::string &db_name = dump_index_cmd->db_name_;
     const std::string &table_id_str = dump_index_cmd->table_id_;
     const std::string &table_name = dump_index_cmd->table_name_;
     const std::string &index_id_str = dump_index_cmd->index_id_;
     const std::string &index_name = dump_index_cmd->index_name_;
     SegmentID segment_id = dump_index_cmd->segment_id_;
 
-    TableMeta table_meta(db_id_str, table_id_str, table_name, this);
+    TableMeta table_meta(db_id_str, db_name, table_id_str, table_name, this);
 
     TableIndexMeta table_index_meta(index_id_str, index_name, table_meta);
 
@@ -3041,7 +3278,8 @@ Status NewTxn::ManualDumpIndex(const std::string &db_name, const std::string &ta
 
             // 4. Get memory index for this segment
             std::shared_ptr<MemIndex> mem_index = segment_index_meta.GetMemIndex();
-            if (mem_index == nullptr || (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr)) {
+            if (mem_index == nullptr ||
+                (mem_index->GetBaseMemIndex() == nullptr && mem_index->GetEMVBIndex() == nullptr && mem_index->GetSMVEIndex() == nullptr)) {
                 LOG_INFO(fmt::format("Skipping segment {} - no memory index to dump", segment_id));
                 continue;
             }
@@ -3087,6 +3325,65 @@ Status NewTxn::ManualDumpIndex(const std::string &db_name, const std::string &ta
         // }
     }
 
+    return Status::OK();
+}
+
+Status NewTxn::PopulateSMVEIndexInner(std::shared_ptr<IndexBase> index_base,
+                                      SegmentIndexMeta &segment_index_meta,
+                                      SegmentMeta &segment_meta,
+                                      size_t segment_row_cnt,
+                                      ColumnID column_id,
+                                      std::shared_ptr<ColumnDef> column_def,
+                                      std::vector<ChunkID> &new_chunk_ids) {
+    auto mem_index = segment_index_meta.GetMemIndex(true);
+    std::shared_ptr<SMVEIndexInMem> memory_smve_index;
+    bool is_null = true;
+
+    auto [block_ids, status] = segment_meta.GetBlockIDs1();
+    if (!status.ok()) {
+        return status;
+    }
+    size_t block_capacity = DEFAULT_BLOCK_CAPACITY;
+    for (BlockID block_id : *block_ids) {
+        BlockMeta block_meta(block_id, segment_meta);
+        ColumnMeta column_meta(column_id, block_meta);
+
+        size_t row_cnt = block_id == block_ids->back() ? segment_row_cnt - block_capacity * (block_ids->size() - 1) : block_capacity;
+
+        ColumnVector col;
+        status = NewCatalog::GetColumnVector(column_meta, column_meta.get_column_def(), row_cnt, ColumnVectorMode::kReadOnly, col);
+        if (!status.ok()) {
+            return status;
+        }
+        u32 offset = 0;
+
+        SegmentOffset block_offset = block_id * DEFAULT_BLOCK_CAPACITY;
+        RowID base_row_id = RowID(segment_index_meta.segment_id(), block_offset + offset);
+        if (is_null) {
+            memory_smve_index = std::make_shared<SMVEIndexInMem>(base_row_id, index_base.get(), column_def.get());
+            mem_index->SetSMVEIndex(memory_smve_index);
+            is_null = false;
+        } else {
+            memory_smve_index = mem_index->GetSMVEIndex();
+        }
+
+        memory_smve_index->BuildFromColumn(col, block_offset, offset, row_cnt);
+    }
+
+    mem_index->UpdateEnd();
+
+    ChunkID new_chunk_id = 0;
+    std::tie(new_chunk_id, status) = segment_index_meta.GetAndSetNextChunkID();
+    if (!status.ok()) {
+        return status;
+    }
+
+    new_chunk_ids.push_back(new_chunk_id);
+
+    status = DumpSegmentMemIndex(segment_index_meta, new_chunk_id);
+    if (!status.ok()) {
+        return status;
+    }
     return Status::OK();
 }
 
